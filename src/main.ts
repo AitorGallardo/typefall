@@ -22,7 +22,7 @@ const isTouch = matchMedia('(hover: none) and (pointer: coarse)').matches;
 // Renderer / scene / camera
 // ---------------------------------------------------------------------------
 const canvas = document.getElementById('scene') as HTMLCanvasElement;
-const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.shadowMap.enabled = true;
@@ -32,7 +32,39 @@ renderer.toneMappingExposure = 1.15;
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(BG);
-scene.fog = new THREE.Fog(BG, 26, 60);
+
+// Debug handle (harmless in prod): lets tooling inspect/render the scene.
+(window as unknown as { typefall: unknown }).typefall = {
+  get scene() { return scene; },
+  get renderer() { return renderer; },
+  get camera() { return camera; },
+  get world() { return world; },
+  get letters() { return letters; },
+  spawnLetter: (ch: string) => spawnLetter(ch),
+  // Deterministic settle helper for pixel testing: drop all live bodies into a
+  // tight pile at origin, step the physics world hard, then render.
+  settle(n = 60) {
+    for (const l of letters) {
+      if (l.fading) continue;
+      l.body.type = CANNON.Body.DYNAMIC;
+      l.body.wakeUp();
+      l.body.position.set((Math.random() - 0.5) * 6, 0.6 + Math.random() * 6, (Math.random() - 0.5) * 4);
+      l.body.velocity.set(0, -2, 0);
+    }
+    for (let i = 0; i < n * 8; i++) world.step(1 / 60);
+    for (const l of letters) {
+      const p = l.body.position;
+      l.mesh.position.set(p.x, p.y, p.z);
+      l.mesh.quaternion.set(l.body.quaternion.x, l.body.quaternion.y, l.body.quaternion.z, l.body.quaternion.w);
+    }
+    renderer.render(scene, camera);
+    return letters.filter((l) => !l.fading).length;
+  },
+};
+// Fog near-plane pushed well past the letter pile (which sits ~25-35 units
+// from the orbiting camera at radius 24). Keeps settled letters clear while
+// still fading the far edges of the 120-unit floor into the dark background.
+scene.fog = new THREE.Fog(BG, 48, 100);
 
 const camera = new THREE.PerspectiveCamera(48, window.innerWidth / window.innerHeight, 0.1, 200);
 const camTarget = new THREE.Vector3(0, 3.2, 0);
@@ -56,12 +88,17 @@ applyCamera();
 // ---------------------------------------------------------------------------
 // Lighting
 // ---------------------------------------------------------------------------
-scene.add(new THREE.HemisphereLight(0x334155, 0x0a0a0a, 0.35));
-const ambient = new THREE.AmbientLight(0xffffff, 0.12);
+// Hemisphere gives the whole floor area a soft ambient fill: brighter sky
+// tone plus a non-black ground bounce so faces not hit by the key still read.
+scene.add(new THREE.HemisphereLight(0x3a3a40, 0x16161a, 0.75));
+const ambient = new THREE.AmbientLight(0xffffff, 0.2);
 scene.add(ambient);
 
-const key = new THREE.DirectionalLight(0xffffff, 2.1);
+const key = new THREE.DirectionalLight(0xffffff, 2.3);
 key.position.set(6, 16, 8);
+// Aim the key (and its shadow frustum) at the pile centre just above the floor.
+key.target.position.set(0, 1.5, 0);
+scene.add(key.target);
 key.castShadow = true;
 key.shadow.mapSize.set(2048, 2048);
 key.shadow.camera.near = 1;
@@ -189,10 +226,13 @@ function spawnLetter(ch: string, x = 0, opts: { accent?: boolean; impulse?: numb
   const accent = opts.accent ?? (++accentTick % 7 === 0);
   const mat = new THREE.MeshStandardMaterial({
     color: accent ? GREEN : WHITE,
-    roughness: 0.42,
-    metalness: 0.15,
-    emissive: accent ? GREEN : 0x000000,
-    emissiveIntensity: accent ? 0.32 : 0,
+    roughness: 0.5,
+    // Near-zero metalness so faces stay diffusely lit (metal eats fill light
+    // and reads black when the environment is dark). A touch of emissive on
+    // white letters keeps settled faces off the floor's near-black value.
+    metalness: 0.02,
+    emissive: accent ? GREEN : WHITE,
+    emissiveIntensity: accent ? 0.32 : 0.06,
     transparent: true,
     opacity: 1,
   });
