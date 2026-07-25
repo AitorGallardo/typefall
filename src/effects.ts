@@ -459,6 +459,16 @@ export class EffectSystem {
     this.doFall(mesh, opts);
   }
 
+  /** One restrained outward particle burst — the new-personal-best moment. */
+  burst(x: number, y: number, z: number, color: THREE.Color): void {
+    const n = this.mobile ? 28 : 54;
+    for (let i = 0; i < n; i++) {
+      const dir = randDir();
+      const speed = 5 + Math.random() * 6;
+      this.emit(x, y, z, dir.x * speed, dir.y * speed * 0.8, dir.z * speed, color, 0.7 + Math.random() * 0.3, 5);
+    }
+  }
+
   /** Number of live physics bodies (for the debug handle). */
   get fallCount(): number {
     return this.fall.filter((f) => !f.fading).length;

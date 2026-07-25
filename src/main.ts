@@ -27,7 +27,15 @@ const GREEN = 0x22c55e;
 const RED = 0xef4444;
 
 const LETTER_SIZE = 1.55;
-const LETTER_SPACING = 0.16;
+const LETTER_SPACING = 0.14;
+
+// Brightness tiers shared by both views. Active word is self-lit and bright so
+// it clearly leads; upcoming text is readable but plainly dimmer (monkeytype's
+// hierarchy). Green marks the caret's letter.
+const EMISSIVE_ACTIVE = 0.5;
+const EMISSIVE_REST = 0.12;
+const EMISSIVE_PENDING = 0.6;
+const OPACITY_UPCOMING = 0.4; // dim tier for not-yet-typed words
 
 // --- stream layout ---
 const BASE_Y = 4.2;
@@ -36,19 +44,26 @@ const Y_RISE = 0.42;
 const SCALE_FALLOFF = 0.85;
 const WINDOW = 7; // visible upcoming words (including current)
 
+// Floor sits well below the text so falling debris and shadows stay out of the
+// reading zone — background flavor, not clutter.
+const FLOOR_Y = -5.5;
+
 // --- paragraph layout ---
-const PARA_SCALE = 0.52; // word scale on the text wall
-const PARA_LINE_WIDTH = 24; // world units of usable line width
-const PARA_SPACE_WORLD = 0.85; // gap between words on a line
-const PARA_TOP_Y = 6.4; // y of the active (top) visible line
-const PARA_LINE_GAP = 2.55; // vertical spacing between lines
+const PARA_SCALE = 0.5; // word scale on the text wall
+const PARA_LINE_WIDTH = 18; // world units of usable line width (a centered column)
+const PARA_SPACE_WORLD = 0.92; // gap between words on a line
+const PARA_TOP_Y = 6.0; // y of the active (top) visible line
+const PARA_LINE_GAP = 2.4; // vertical spacing between lines
 const PARA_VISIBLE = 3; // rows shown at once (active + upcoming)
 
-// --- per-view cameras ---
+// --- per-view cameras (fov chosen per view; paragraph is flat/near-orthographic
+// so rows stay parallel and letters keep a uniform size — the "tool" feel) ---
 const STREAM_CAM_BASE = new THREE.Vector3(0, 5.6, 13.5);
 const STREAM_CAM_LOOK = new THREE.Vector3(0, 4.0, -4);
-const PARA_CAM_BASE = new THREE.Vector3(0, 3.9, 20.5);
-const PARA_CAM_LOOK = new THREE.Vector3(0, 3.9, -0.5);
+const STREAM_FOV = 50;
+const PARA_CAM_BASE = new THREE.Vector3(0, 3.6, 30);
+const PARA_CAM_LOOK = new THREE.Vector3(0, 3.6, 0);
+const PARA_FOV = 28;
 
 const isTouch = matchMedia('(hover: none) and (pointer: coarse)').matches;
 
@@ -68,7 +83,7 @@ const scene = new THREE.Scene();
 scene.background = new THREE.Color(BG);
 scene.fog = new THREE.Fog(BG, 26, 62);
 
-const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 200);
+const camera = new THREE.PerspectiveCamera(STREAM_FOV, window.innerWidth / window.innerHeight, 0.1, 200);
 const camBase = STREAM_CAM_BASE.clone();
 const camLook = STREAM_CAM_LOOK.clone();
 const shake = new THREE.Vector3();
@@ -117,11 +132,12 @@ const floor = new THREE.Mesh(
   new THREE.MeshStandardMaterial({ color: 0x101012, roughness: 0.95, metalness: 0 }),
 );
 floor.rotation.x = -Math.PI / 2;
+floor.position.y = FLOOR_Y;
 floor.receiveShadow = true;
 scene.add(floor);
 
-const grid = new THREE.GridHelper(120, 60, 0x1b1b20, 0x141418);
-grid.position.y = 0.01;
+const grid = new THREE.GridHelper(120, 60, 0x161619, 0x111114);
+grid.position.y = FLOOR_Y + 0.01;
 (grid.material as THREE.Material).transparent = true;
 (grid.material as THREE.Material).opacity = 0.5;
 scene.add(grid);
@@ -137,6 +153,7 @@ world.defaultContactMaterial.restitution = 0.12;
 
 const groundBody = new CANNON.Body({ type: CANNON.Body.STATIC, shape: new CANNON.Plane() });
 groundBody.quaternion.setFromEuler(-Math.PI / 2, 0, 0);
+groundBody.position.set(0, FLOOR_Y, 0);
 world.addBody(groundBody);
 
 function addWall(nx: number, nz: number, px: number, pz: number) {
@@ -269,12 +286,19 @@ function disposeWord(group: THREE.Group, letters: LayoutLetter[]) {
 function markPending(l: LayoutLetter) {
   l.mat.color.setHex(GREEN);
   l.mat.emissive.setHex(GREEN);
-  l.mat.emissiveIntensity = 0.55;
+  l.mat.emissiveIntensity = EMISSIVE_PENDING;
 }
+// Letters of the active word (except the caret letter): full, self-lit white.
+function markActive(l: LayoutLetter) {
+  l.mat.color.setHex(WHITE);
+  l.mat.emissive.setHex(WHITE);
+  l.mat.emissiveIntensity = EMISSIVE_ACTIVE;
+}
+// Upcoming / resting letters: plain white, dimmed by the opacity tier.
 function markNormal(l: LayoutLetter) {
   l.mat.color.setHex(WHITE);
   l.mat.emissive.setHex(WHITE);
-  l.mat.emissiveIntensity = 0.08;
+  l.mat.emissiveIntensity = EMISSIVE_REST;
 }
 
 // Detach a letter from its word: reparent it to the scene at its current world
@@ -311,6 +335,7 @@ interface View {
   dispose(): void;
   readonly camBase: THREE.Vector3;
   readonly camLook: THREE.Vector3;
+  readonly camFov: number;
   info(): Record<string, unknown>;
 }
 
@@ -363,7 +388,7 @@ function makeStreamView(): View {
     }
     for (let i = 0; i < cur.letters.length; i++) {
       if (i === letterIdx) markPending(cur.letters[i]);
-      else markNormal(cur.letters[i]);
+      else markActive(cur.letters[i]);
     }
   }
 
@@ -375,6 +400,7 @@ function makeStreamView(): View {
   return {
     camBase: STREAM_CAM_BASE,
     camLook: STREAM_CAM_LOOK,
+    camFov: STREAM_FOV,
     currentWord() {
       const cur = visible[0];
       return cur ? { group: cur.group, letters: cur.letters } : null;
@@ -497,10 +523,11 @@ function makeParagraphView(): View {
   function paint(): void {
     for (const l of lines) {
       for (const w of l.words) {
-        const dist = w.seqIndex - wordIndex;
-        w.opacity = w.seqIndex < wordIndex ? 0 : dist === 0 ? 1 : 0.5;
+        const active = w.seqIndex === wordIndex;
+        w.opacity = w.seqIndex < wordIndex ? 0 : active ? 1 : OPACITY_UPCOMING;
         for (let i = 0; i < w.letters.length; i++) {
-          if (w.seqIndex === wordIndex && i === letterIdx) markPending(w.letters[i]);
+          if (active && i === letterIdx) markPending(w.letters[i]);
+          else if (active) markActive(w.letters[i]);
           else markNormal(w.letters[i]);
         }
       }
@@ -514,6 +541,7 @@ function makeParagraphView(): View {
   return {
     camBase: PARA_CAM_BASE,
     camLook: PARA_CAM_LOOK,
+    camFov: PARA_FOV,
     currentWord() {
       for (const l of lines) {
         if (l.index !== top) continue;
@@ -586,18 +614,76 @@ const state = {
   correct: 0,
   incorrect: 0,
   wordsDone: 0,
-  startTime: 0,
-  endTime: 0,
+  elapsed: 0, // seconds accumulated while running — frame-driven so the debug
+  // handle can run deterministically (see update()).
 };
-let best = Number(localStorage.getItem('typefall.best') || 0);
+// ---------------------------------------------------------------------------
+// Personal bests + history, keyed per config (mode + amount + view) so each
+// setup chases its own highscore — the monkeytype dopamine loop.
+// ---------------------------------------------------------------------------
+interface ScoreRecord {
+  wpm: number;
+  acc: number;
+  raw: number;
+  date: number;
+}
+const PB_PREFIX = 'typefall.pb.v1:';
+const HIST_PREFIX = 'typefall.hist.v1:';
+
+function configKey(): string {
+  const amount = settings.mode === 'time' ? settings.time : settings.mode === 'words' ? settings.words : 0;
+  return `${settings.mode}:${amount}:${settings.view}`;
+}
+function loadPb(key: string): ScoreRecord | null {
+  try {
+    const raw = localStorage.getItem(PB_PREFIX + key);
+    return raw ? (JSON.parse(raw) as ScoreRecord) : null;
+  } catch {
+    return null;
+  }
+}
+function savePb(key: string, rec: ScoreRecord): void {
+  try {
+    localStorage.setItem(PB_PREFIX + key, JSON.stringify(rec));
+  } catch {
+    /* ignore */
+  }
+}
+function loadHistory(key: string): ScoreRecord[] {
+  try {
+    const raw = localStorage.getItem(HIST_PREFIX + key);
+    return raw ? (JSON.parse(raw) as ScoreRecord[]) : [];
+  } catch {
+    return [];
+  }
+}
+function pushHistory(key: string, rec: ScoreRecord): ScoreRecord[] {
+  const h = loadHistory(key);
+  h.unshift(rec);
+  h.length = Math.min(h.length, 5);
+  try {
+    localStorage.setItem(HIST_PREFIX + key, JSON.stringify(h));
+  } catch {
+    /* ignore */
+  }
+  return h;
+}
+
+// Latest finish outcome, surfaced through the debug handle for assertions.
+let lastResult: {
+  key: string;
+  wpm: number;
+  pb: number | null;
+  prevPb: number | null;
+  isNewPb: boolean;
+  historyLen: number;
+} | null = null;
 
 function wordsTotal(): number {
   return settings.mode === 'words' ? settings.words : 0;
 }
 function elapsedSec(): number {
-  if (state.phase === 'ready') return 0;
-  const end = state.phase === 'finished' ? state.endTime : performance.now();
-  return Math.max(0, (end - state.startTime) / 1000);
+  return state.elapsed;
 }
 function liveWpm(): number {
   const t = elapsedSec();
@@ -621,7 +707,7 @@ function accuracy(): number {
 function beginIfNeeded() {
   if (state.phase === 'ready') {
     state.phase = 'running';
-    state.startTime = performance.now();
+    state.elapsed = 0;
   }
 }
 
@@ -700,6 +786,8 @@ function buildView() {
   activeView = settings.view === 'stream' ? makeStreamView() : makeParagraphView();
   camBase.copy(activeView.camBase);
   camLook.copy(activeView.camLook);
+  camera.fov = activeView.camFov;
+  camera.updateProjectionMatrix();
   applyCamera();
 }
 
@@ -708,8 +796,7 @@ function restart() {
   state.correct = 0;
   state.incorrect = 0;
   state.wordsDone = 0;
-  state.startTime = 0;
-  state.endTime = 0;
+  state.elapsed = 0;
   effects.reset();
   shake.set(0, 0, 0);
   ui.hideResults();
@@ -725,16 +812,18 @@ function restart() {
 
 function finish() {
   state.phase = 'finished';
-  state.endTime = performance.now();
   const wpm = liveWpm();
-  if (wpm > best) {
-    best = wpm;
-    try {
-      localStorage.setItem('typefall.best', String(best));
-    } catch {
-      /* ignore */
-    }
-  }
+
+  const key = configKey();
+  const prev = loadPb(key);
+  const prevPb = prev ? prev.wpm : null;
+  const isNewPb = prevPb == null || wpm > prevPb;
+  const rec: ScoreRecord = { wpm, acc: accuracy(), raw: rawWpm(), date: Date.now() };
+  if (isNewPb) savePb(key, rec);
+  const history = pushHistory(key, rec);
+  const deltaPb = isNewPb && prevPb != null ? wpm - prevPb : null;
+  lastResult = { key, wpm, pb: isNewPb ? wpm : prevPb, prevPb, isNewPb, historyLen: history.length };
+
   ui.setHudVisible(false);
   ui.showResults({
     wpm,
@@ -742,31 +831,41 @@ function finish() {
     raw: rawWpm(),
     correct: state.correct,
     incorrect: state.incorrect,
-    best,
+    timeSec: elapsedSec(),
+    pb: prevPb,
+    isNewPb,
+    deltaPb,
+    history: history.map((h) => ({ wpm: h.wpm, acc: h.acc })),
   });
-  rainResultLetters();
+  rainResultLetters(isNewPb);
 }
 
-// Let a handful of letters rain down behind the results panel.
-function rainResultLetters() {
+// Let a few letters rain behind the results — small and dim so the stats read
+// clean. On a new personal best they tint green and a single restrained particle
+// burst fires at the score (the dopamine hit, no confetti spam).
+function rainResultLetters(newPb: boolean) {
+  const tint = newPb ? GREEN : WHITE;
   const chars = 'typefall'.split('');
   for (let i = 0; i < chars.length; i++) {
     const glyph = getGlyph(chars[i]);
     const mat = new THREE.MeshStandardMaterial({
-      color: WHITE,
+      color: tint,
       roughness: 0.5,
       metalness: 0.02,
-      emissive: WHITE,
-      emissiveIntensity: 0.08,
+      emissive: tint,
+      emissiveIntensity: newPb ? 0.28 : 0.08,
       transparent: true,
       opacity: 1,
     });
     const mesh = new THREE.Mesh(glyph.geo, mat);
     mesh.castShadow = true;
-    mesh.position.set((Math.random() - 0.5) * 12, 12 + Math.random() * 6, (Math.random() - 0.5) * 4);
+    mesh.scale.setScalar(0.6);
+    mesh.position.set((Math.random() - 0.5) * 16, 10 + Math.random() * 6, -3 - Math.random() * 4);
     scene.add(mesh);
-    effects.rain(mesh, { color: new THREE.Color(WHITE), half: glyph.half });
+    const half = new CANNON.Vec3(glyph.half.x * 0.6, glyph.half.y * 0.6, glyph.half.z * 0.6);
+    effects.rain(mesh, { color: new THREE.Color(tint), half });
   }
+  if (newPb) effects.burst(0, 4.2, 1, new THREE.Color(GREEN));
 }
 
 // ---------------------------------------------------------------------------
@@ -847,6 +946,8 @@ let hudAccum = 0;
 function update(dt: number) {
   world.step(1 / 60, dt, 3);
 
+  if (state.phase === 'running') state.elapsed += dt;
+
   const now = performance.now();
 
   activeView.update(dt);
@@ -884,21 +985,19 @@ function update(dt: number) {
 
 function updateHud() {
   let modeLabel = '';
-  let primary = '';
+  let progress = '';
   if (settings.mode === 'time') {
     modeLabel = 'time';
     const remain = Math.max(0, settings.time - elapsedSec());
-    primary = state.phase === 'ready' ? String(settings.time) : String(Math.ceil(remain));
+    progress = state.phase === 'ready' ? String(settings.time) : String(Math.ceil(remain));
   } else if (settings.mode === 'words') {
     modeLabel = 'words';
-    primary = `${state.wordsDone}/${settings.words}`;
+    progress = `${state.wordsDone}/${settings.words}`;
   } else {
     modeLabel = 'zen';
-    primary = String(state.wordsDone);
+    progress = String(state.wordsDone);
   }
-  const stats =
-    state.phase === 'ready' ? 'type to start' : `${liveWpm()} wpm · ${accuracy()}% acc`;
-  ui.setHud(modeLabel, primary, stats);
+  ui.setHud(modeLabel, progress, `${liveWpm()} wpm`, `${accuracy()}%`, state.phase === 'running');
 }
 
 function render() {
@@ -952,6 +1051,9 @@ function snapshot() {
     menuOpen: ui.isMenuOpen(),
     resultsShown: state.phase === 'finished',
     layout: activeView ? activeView.info() : {},
+    configKey: configKey(),
+    pb: loadPb(configKey())?.wpm ?? null,
+    lastResult,
   };
 }
 

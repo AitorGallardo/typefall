@@ -17,7 +17,11 @@ export interface ResultStats {
   raw: number;
   correct: number;
   incorrect: number;
-  best: number;
+  timeSec: number;
+  pb: number | null; // previous best wpm for this config (null = none yet)
+  isNewPb: boolean;
+  deltaPb: number | null; // wpm - previous best, when beaten and a prior best existed
+  history: { wpm: number; acc: number }[]; // most-recent-first, up to 5
 }
 
 export interface UICallbacks {
@@ -36,12 +40,17 @@ export function createUI(cb: UICallbacks) {
   root.id = 'ui';
   document.body.appendChild(root);
 
-  // --- live HUD ---------------------------------------------------------
+  // --- live HUD (one sober mono line: mode/progress · wpm · acc) ---------
   const hud = el('div', 'hud');
   const hudMode = el('span', 'hud-mode');
-  const hudPrimary = el('span', 'hud-primary');
-  const hudStats = el('span', 'hud-stats');
-  hud.append(hudMode, hudPrimary, hudStats);
+  const hudProgress = el('span', 'hud-progress');
+  const sep1 = el('span', 'hud-sep');
+  sep1.textContent = '·';
+  const hudWpm = el('span', 'hud-metric');
+  const sep2 = el('span', 'hud-sep');
+  sep2.textContent = '·';
+  const hudAcc = el('span', 'hud-metric');
+  hud.append(hudMode, hudProgress, sep1, hudWpm, sep2, hudAcc);
 
   const gear = el('button', 'gear');
   gear.textContent = '⚙';
@@ -55,10 +64,12 @@ export function createUI(cb: UICallbacks) {
   const rWpm = el('div', 'r-wpm');
   const rWpmLabel = el('div', 'r-label');
   rWpmLabel.textContent = 'wpm';
+  const rPb = el('div', 'r-pb');
   const rGrid = el('div', 'r-grid');
+  const rHistory = el('div', 'r-history');
   const rHint = el('div', 'r-hint');
   rHint.innerHTML = 'restart <span class="k">tab</span> + <span class="k">enter</span> · or click';
-  results.append(rWpm, rWpmLabel, rGrid, rHint);
+  results.append(rWpm, rWpmLabel, rPb, rGrid, rHistory, rHint);
   results.addEventListener('click', () => cb.restart());
 
   // --- settings / menu panel -------------------------------------------
@@ -207,22 +218,36 @@ export function createUI(cb: UICallbacks) {
   }
 
   return {
-    setHud(modeLabel: string, primary: string, stats: string) {
+    setHud(modeLabel: string, progress: string, wpm: string, acc: string, active: boolean) {
       hudMode.textContent = modeLabel;
-      hudPrimary.textContent = primary;
-      hudStats.textContent = stats;
+      hudProgress.textContent = progress;
+      hudWpm.textContent = wpm;
+      hudAcc.textContent = acc;
+      hud.classList.toggle('active', active);
     },
     setHudVisible(v: boolean) {
-      hud.style.opacity = v ? '1' : '0';
+      hud.style.opacity = v ? '' : '0';
     },
     showResults(st: ResultStats) {
       rWpm.textContent = String(st.wpm);
+      rWpm.classList.toggle('pb', st.isNewPb);
+
+      // The personal-best line: restrained normally, unmistakable when beaten.
+      if (st.isNewPb) {
+        rPb.classList.add('is-new');
+        rPb.textContent =
+          st.deltaPb != null ? `new personal best  +${st.deltaPb}` : 'new personal best';
+      } else {
+        rPb.classList.remove('is-new');
+        rPb.textContent = st.pb != null ? `pb ${st.pb}` : 'no pb yet';
+      }
+
       rGrid.innerHTML = '';
       const cells: [string, string][] = [
         ['acc', st.acc + '%'],
         ['raw', String(st.raw)],
         ['chars', `${st.correct}/${st.incorrect}`],
-        ['best', String(st.best)],
+        ['time', `${st.timeSec.toFixed(1)}s`],
       ];
       for (const [k, v] of cells) {
         const cell = el('div', 'r-cell');
@@ -233,6 +258,22 @@ export function createUI(cb: UICallbacks) {
         cell.append(kk, vv);
         rGrid.appendChild(cell);
       }
+
+      // Tiny most-recent-first history (skip if there's nothing prior).
+      rHistory.innerHTML = '';
+      if (st.history.length > 1) {
+        for (let i = 0; i < st.history.length; i++) {
+          const h = st.history[i];
+          const row = el('div', 'r-hrow' + (i === 0 ? ' now' : ''));
+          const w = el('span', 'r-hwpm');
+          w.textContent = String(h.wpm);
+          const a = el('span', 'r-hacc');
+          a.textContent = h.acc + '%';
+          row.append(w, a);
+          rHistory.appendChild(row);
+        }
+      }
+
       results.classList.remove('hidden');
     },
     hideResults() {
