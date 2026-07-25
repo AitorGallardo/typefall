@@ -11,31 +11,41 @@ import { createUI } from './ui';
 // ---------------------------------------------------------------------------
 // A monkeytype-style typing test rendered inside a 3D scene. Two presentations
 // share the same scoring, effects and input:
-//   • paragraph (default) — the upcoming text is laid out as a readable wall of
-//     3 rows facing the camera; the active word is bright with a green caret, the
-//     rest recede in brightness, and finished lines scroll up out of view.
+//   • paragraph (default) — a measured-flow layout engine places words by their
+//     glyph widths into a centered column and shows three lines at once; the
+//     active word is bright with a thin green caret, upcoming words are muted,
+//     typed letters turn green, mistakes red, and finished lines scroll up.
 //   • stream — upcoming words fly in from the background; the current word sits
 //     up front and the next few recede and dim.
-// Each correct keystroke detaches that letter and fires the selected completion
-// effect. Wrong keys flash red, nudge the camera, and count as errors
-// (monkeytype "stop on letter").
+// Each correct keystroke locks the letter in place (green) and blows away a
+// clone with the selected effect, so the passage never reflows. A wrong key
+// turns the letter red and advances the caret; backspace restores letters in
+// the current word, which won't complete until every character is correct.
 // ---------------------------------------------------------------------------
 
 const BG = 0x0a0a0a;
 const WHITE = 0xe8e8ea;
 const GREEN = 0x22c55e;
 const RED = 0xef4444;
+const GRAY = 0x878d99; // upcoming words — muted but comfortably readable on black
 
 const LETTER_SIZE = 1.55;
-const LETTER_SPACING = 0.14;
+const LETTER_SPACING = 0.1;
 
-// Brightness tiers shared by both views. Active word is self-lit and bright so
-// it clearly leads; upcoming text is readable but plainly dimmer (monkeytype's
-// hierarchy). Green marks the caret's letter.
-const EMISSIVE_ACTIVE = 0.5;
-const EMISSIVE_REST = 0.12;
-const EMISSIVE_PENDING = 0.6;
-const OPACITY_UPCOMING = 0.4; // dim tier for not-yet-typed words
+// Self-lit emissive tiers, keyed by a letter's typing state. Each state is
+// readable regardless of scene lighting, and the tiers form monkeytype's
+// hierarchy: the active word leads, upcoming text recedes, typed text is the
+// green accent, mistakes are red, finished words sink to a quiet trail.
+const EM_CURRENT = 0.42; // active word, not yet typed
+const EM_CORRECT = 0.34; // typed correctly — green accent
+const EM_INCORRECT = 0.5; // typed wrong — red until corrected
+const EM_UPCOMING = 0.07; // words further ahead — muted gray
+const EM_COMPLETED = 0.06; // finished words — subordinate
+
+// Opacity tiers (the paragraph view multiplies these by a per-line fade).
+const OP_CURRENT = 1;
+const OP_UPCOMING = 0.6;
+const OP_COMPLETED = 0.42;
 
 // --- stream layout ---
 const BASE_Y = 4.2;
@@ -48,13 +58,18 @@ const WINDOW = 7; // visible upcoming words (including current)
 // reading zone — background flavor, not clutter.
 const FLOOR_Y = -5.5;
 
-// --- paragraph layout ---
-const PARA_SCALE = 0.5; // word scale on the text wall
-const PARA_LINE_WIDTH = 18; // world units of usable line width (a centered column)
-const PARA_SPACE_WORLD = 0.92; // gap between words on a line
-const PARA_TOP_Y = 6.0; // y of the active (top) visible line
-const PARA_LINE_GAP = 2.4; // vertical spacing between lines
-const PARA_VISIBLE = 3; // rows shown at once (active + upcoming)
+// --- paragraph layout (a measured-flow engine; see makeParagraphView) ---
+// Everything is expressed in em (1em = the on-screen font height) and derived
+// from the camera frustum at render time, so the passage keeps the same CSS-px
+// size and centered column at 1024 / 1440 / 1920 and every aspect ratio — no
+// hardcoded world coordinates that only look right at one resolution.
+const PARA_FONT_PX = 30; // target on-screen em height in CSS pixels
+const PARA_COL_VW = 0.78; // reading column as a fraction of viewport width…
+const PARA_COL_MAX_PX = 1000; // …capped to this many CSS px (centered)
+const PARA_GAP_EM = 0.55; // inter-word gap (~one normal space)
+const PARA_LINE_EM = 1.42; // line height
+const PARA_VISIBLE = 3; // rows shown at once (active + the next two)
+const PARA_CENTER_BIAS = 0.09; // push the block this fraction of view height above center
 
 // --- per-view cameras (fov chosen per view; paragraph is flat/near-orthographic
 // so rows stay parallel and letters keep a uniform size — the "tool" feel) ---
@@ -100,7 +115,7 @@ applyCamera();
 scene.add(new THREE.HemisphereLight(0x3a3a40, 0x16161a, 0.75));
 scene.add(new THREE.AmbientLight(0xffffff, 0.22));
 
-const key = new THREE.DirectionalLight(0xffffff, 2.2);
+const key = new THREE.DirectionalLight(0xffffff, 1.55);
 key.position.set(5, 16, 12);
 key.target.position.set(0, 3, 0);
 scene.add(key.target);
@@ -136,10 +151,10 @@ floor.position.y = FLOOR_Y;
 floor.receiveShadow = true;
 scene.add(floor);
 
-const grid = new THREE.GridHelper(120, 60, 0x161619, 0x111114);
+const grid = new THREE.GridHelper(120, 60, 0x141417, 0x0f0f12);
 grid.position.y = FLOOR_Y + 0.01;
 (grid.material as THREE.Material).transparent = true;
-(grid.material as THREE.Material).opacity = 0.5;
+(grid.material as THREE.Material).opacity = 0.22;
 scene.add(grid);
 
 // ---------------------------------------------------------------------------
@@ -184,14 +199,17 @@ let font: Font | null = null;
 function getGlyph(ch: string): Glyph {
   let g = glyphCache.get(ch);
   if (g) return g;
+  // Shallow extrusion + a whisper of bevel: enough to keep Typefall's
+  // dimensional identity, flat enough that the paragraph reads like type
+  // rather than a row of chunky objects.
   const geo = new TextGeometry(ch, {
     font: font!,
     size: LETTER_SIZE,
-    depth: LETTER_SIZE * 0.4,
+    depth: LETTER_SIZE * 0.16,
     curveSegments: 5,
     bevelEnabled: true,
-    bevelThickness: 0.035,
-    bevelSize: 0.025,
+    bevelThickness: 0.02,
+    bevelSize: 0.014,
     bevelSegments: 2,
   });
   geo.computeBoundingBox();
@@ -222,8 +240,11 @@ function wordUnscaledWidth(text: string): number {
 // ---------------------------------------------------------------------------
 // Caret
 // ---------------------------------------------------------------------------
+// A thin green vertical bar. Its world position and scale are recomputed each
+// frame from the active word's glyph advances so it lands exactly on the next
+// character boundary and never overlaps a letter (see updateCaret).
 const caret = new THREE.Mesh(
-  new THREE.BoxGeometry(0.14, LETTER_SIZE * 1.15, 0.14),
+  new THREE.BoxGeometry(0.06, LETTER_SIZE * 1.05, 0.03),
   new THREE.MeshBasicMaterial({ color: GREEN, transparent: true, opacity: 0.9 }),
 );
 caret.visible = false;
@@ -232,19 +253,26 @@ scene.add(caret);
 // ---------------------------------------------------------------------------
 // Shared word / letter primitives
 // ---------------------------------------------------------------------------
+type LetterState = 'untyped' | 'correct' | 'incorrect';
+
 interface LayoutLetter {
   ch: string;
   mesh: THREE.Mesh;
   mat: THREE.MeshStandardMaterial;
-  localX: number; // x within the word group
-  halfWidth: number;
-  errorUntil: number;
-  detached: boolean; // reparented to the scene and owned by the effect system
+  localX: number; // x within the word group (unscaled glyph units)
+  halfWidth: number; // unscaled half advance
+  state: LetterState;
 }
 
 // Build a word group with its letters centred around the group origin. Not
-// added to any parent — the caller places it.
-function createWord(text: string): { group: THREE.Group; letters: LayoutLetter[]; width: number } {
+// added to any parent — the caller scales and places it. The originals stay put
+// for the whole test so their layout slots are reserved (no reflow) and typed
+// letters can be un-typed by backspace; the flying "blow away" effect operates
+// on a clone (see detachClone).
+function createWord(
+  text: string,
+  castShadow = true,
+): { group: THREE.Group; letters: LayoutLetter[]; width: number } {
   const group = new THREE.Group();
   const widths = [...text].map((c) => getGlyph(c).width);
   const total = widths.reduce((a, b) => a + b, 0) + LETTER_SPACING * (text.length - 1);
@@ -253,74 +281,92 @@ function createWord(text: string): { group: THREE.Group; letters: LayoutLetter[]
   [...text].forEach((ch, i) => {
     const glyph = getGlyph(ch);
     const mat = new THREE.MeshStandardMaterial({
-      color: WHITE,
+      color: GRAY,
       roughness: 0.5,
       metalness: 0.02,
-      emissive: WHITE,
-      emissiveIntensity: 0.08,
+      emissive: GRAY,
+      emissiveIntensity: EM_UPCOMING,
       transparent: true,
       opacity: 1,
     });
     const mesh = new THREE.Mesh(glyph.geo, mat);
-    mesh.castShadow = true;
+    mesh.castShadow = castShadow;
     const localX = cursor + widths[i] / 2;
     mesh.position.set(localX, 0, 0);
     group.add(mesh);
-    letters.push({ ch, mesh, mat, localX, halfWidth: widths[i] / 2, errorUntil: 0, detached: false });
+    letters.push({ ch, mesh, mat, localX, halfWidth: widths[i] / 2, state: 'untyped' });
     cursor += widths[i] + LETTER_SPACING;
   });
   return { group, letters, width: total };
 }
 
-// Dispose a word group. Letters that were already detached are owned by the
-// effect system (which disposes them when the effect ends) — never touch those.
+// Dispose a word group and every letter it owns. Flying clones are owned by the
+// effect system (which disposes them when the effect ends) — never touched here.
 function disposeWord(group: THREE.Group, letters: LayoutLetter[]) {
   for (const l of letters) {
-    if (l.detached) continue;
     group.remove(l.mesh);
     l.mat.dispose();
   }
   group.removeFromParent();
 }
 
-function markPending(l: LayoutLetter) {
+// --- per-state colouring (colour + emissive only; opacity is a view concern) ---
+function setUpcoming(l: LayoutLetter) {
+  l.mat.color.setHex(GRAY);
+  l.mat.emissive.setHex(GRAY);
+  l.mat.emissiveIntensity = EM_UPCOMING;
+}
+function setCurrentUntyped(l: LayoutLetter) {
+  l.mat.color.setHex(WHITE);
+  l.mat.emissive.setHex(WHITE);
+  l.mat.emissiveIntensity = EM_CURRENT;
+}
+function setCorrect(l: LayoutLetter) {
   l.mat.color.setHex(GREEN);
   l.mat.emissive.setHex(GREEN);
-  l.mat.emissiveIntensity = EMISSIVE_PENDING;
+  l.mat.emissiveIntensity = EM_CORRECT;
 }
-// Letters of the active word (except the caret letter): full, self-lit white.
-function markActive(l: LayoutLetter) {
-  l.mat.color.setHex(WHITE);
-  l.mat.emissive.setHex(WHITE);
-  l.mat.emissiveIntensity = EMISSIVE_ACTIVE;
+function setIncorrect(l: LayoutLetter) {
+  l.mat.color.setHex(RED);
+  l.mat.emissive.setHex(RED);
+  l.mat.emissiveIntensity = EM_INCORRECT;
 }
-// Upcoming / resting letters: plain white, dimmed by the opacity tier.
-function markNormal(l: LayoutLetter) {
-  l.mat.color.setHex(WHITE);
-  l.mat.emissive.setHex(WHITE);
-  l.mat.emissiveIntensity = EMISSIVE_REST;
+function setCompleted(l: LayoutLetter) {
+  l.mat.color.setHex(GREEN);
+  l.mat.emissive.setHex(GREEN);
+  l.mat.emissiveIntensity = EM_COMPLETED;
 }
 
-// Detach a letter from its word: reparent it to the scene at its current world
-// transform (keeping the on-screen scale) and hand it to the effect system.
-function detachLetterMesh(l: LayoutLetter, group: THREE.Group, effect: EffectId) {
-  const mesh = l.mesh;
-  mesh.updateWorldMatrix(true, false);
+// Spawn a flying clone of a just-typed letter at its exact on-screen transform
+// and hand it to the effect system. The original letter is left in place (it
+// turns green and holds its layout slot), so the passage never reflows and
+// backspace can restore the letter to an untyped state.
+function detachClone(l: LayoutLetter, effect: EffectId) {
+  const src = l.mesh;
+  src.updateWorldMatrix(true, false);
   const wp = new THREE.Vector3();
   const wq = new THREE.Quaternion();
   const ws = new THREE.Vector3();
-  mesh.matrixWorld.decompose(wp, wq, ws);
-  group.remove(mesh);
-  scene.add(mesh);
-  mesh.position.copy(wp);
-  mesh.quaternion.copy(wq);
-  mesh.scale.copy(ws);
-  l.detached = true;
-  markNormal(l);
-  l.mat.opacity = 1;
+  src.matrixWorld.decompose(wp, wq, ws);
   const glyph = getGlyph(l.ch);
+  const mat = new THREE.MeshStandardMaterial({
+    color: WHITE,
+    roughness: 0.5,
+    metalness: 0.02,
+    emissive: WHITE,
+    emissiveIntensity: 0.12,
+    transparent: true,
+    opacity: 1,
+  });
+  const clone = new THREE.Mesh(glyph.geo, mat);
+  clone.castShadow = true;
+  clone.position.copy(wp);
+  clone.position.z += 0.5; // peel toward the camera so it never falls through lines below
+  clone.quaternion.copy(wq);
+  clone.scale.copy(ws);
+  scene.add(clone);
   const half = new CANNON.Vec3(glyph.half.x * ws.x, glyph.half.y * ws.y, glyph.half.z * ws.z);
-  effects.play(effect, mesh, { color: new THREE.Color(WHITE), half });
+  effects.play(effect, clone, { color: new THREE.Color(WHITE), half });
 }
 
 // ---------------------------------------------------------------------------
@@ -332,16 +378,21 @@ interface View {
   paint(): void; // (re)apply highlight + dim state
   advance(): void; // move to the next word (scroll / slide)
   update(dt: number): void; // per-frame layout easing
+  relayout(): void; // recompute layout for a new viewport (keeps progress)
   dispose(): void;
   readonly camBase: THREE.Vector3;
   readonly camLook: THREE.Vector3;
   readonly camFov: number;
+  readonly lockCamera: boolean; // true → the reading surface never drifts (no shake)
   info(): Record<string, unknown>;
 }
 
 let seq: string[] = [];
 let wordIndex = 0; // index in seq of the current word
-let letterIdx = 0; // next letter to type in the current word
+let letterIdx = 0; // cursor within the current word (chars committed, right or wrong)
+// Per-char states of the letters already committed in the current word. Kept at
+// module scope so a viewport relayout can restore red/green after a rebuild.
+let letterStates: LetterState[] = [];
 let activeView: View;
 
 function ensureSeq(n: number) {
@@ -380,15 +431,15 @@ function makeStreamView(): View {
     return { group, letters, targetSlot: slot };
   }
 
+  // Colour the front (active) word from its per-char state; further words stay
+  // muted gray and are dimmed by the slot opacity.
   function paint(): void {
     const cur = visible[0];
-    if (!cur) {
-      caret.visible = false;
-      return;
-    }
+    if (!cur) return;
     for (let i = 0; i < cur.letters.length; i++) {
-      if (i === letterIdx) markPending(cur.letters[i]);
-      else markActive(cur.letters[i]);
+      const l = cur.letters[i];
+      if (i < letterIdx) letterStates[i] === 'incorrect' ? setIncorrect(l) : setCorrect(l);
+      else setCurrentUntyped(l);
     }
   }
 
@@ -401,6 +452,7 @@ function makeStreamView(): View {
     camBase: STREAM_CAM_BASE,
     camLook: STREAM_CAM_LOOK,
     camFov: STREAM_FOV,
+    lockCamera: false,
     currentWord() {
       const cur = visible[0];
       return cur ? { group: cur.group, letters: cur.letters } : null;
@@ -422,7 +474,6 @@ function makeStreamView(): View {
       paint();
     },
     update(dt: number) {
-      const now = performance.now();
       const lerp = 1 - Math.pow(0.0015, dt);
       for (const w of visible) {
         slotPos(w.targetSlot, tmpVec);
@@ -430,16 +481,11 @@ function makeStreamView(): View {
         const ts = slotScale(w.targetSlot);
         w.group.scale.setScalar(THREE.MathUtils.lerp(w.group.scale.x, ts, lerp));
         const op = slotOpacity(w.targetSlot);
-        for (const l of w.letters) {
-          if (l.detached) continue;
-          if (l.errorUntil) {
-            if (now < l.errorUntil) continue;
-            l.errorUntil = 0;
-            paint();
-          }
-          l.mat.opacity = op;
-        }
+        for (const l of w.letters) l.mat.opacity = op;
       }
+    },
+    relayout() {
+      /* stream slots are camera-relative — nothing to recompute on resize */
     },
     dispose() {
       for (const w of visible) disposeWord(w.group, w.letters);
@@ -452,11 +498,41 @@ function makeStreamView(): View {
 }
 
 // ---------------------------------------------------------------------------
-// Paragraph view — monkeytype-style wall of rows. Words are packed into lines by
-// width; PARA_VISIBLE lines are shown at once with the active line on top.
-// Finishing the active line scrolls the whole block up: the finished line slides
-// out the top and a fresh line slides in at the bottom.
+// Paragraph view — a measured-flow layout engine, monkeytype's readability in
+// Typefall's 3D language. Words flow left→right and wrap by their actual glyph
+// width into a centered, px-consistent column; PARA_VISIBLE lines show at once
+// with the active line on top. Finishing the active line scrolls the block up
+// one line — deterministically — the finished line fading out above and a fresh
+// line fading in below. All coordinates derive from the camera frustum, so the
+// passage keeps its size and column at any resolution and never reflows on a
+// keystroke (only on a viewport resize).
 // ---------------------------------------------------------------------------
+interface ParaMetrics {
+  scale: number; // word-group scale (glyph units → world)
+  colHalf: number; // half the reading-column width, world units
+  gap: number; // inter-word gap, world units
+  lineH: number; // line height, world units
+  topY: number; // world y of the top (active) visible line
+}
+
+function paraMetrics(): ParaMetrics {
+  // Camera looks straight down -z at the z=0 text plane, so the view distance
+  // to the plane is exactly the camera's z. Derive the visible frustum there.
+  const dist = PARA_CAM_BASE.z;
+  const visH = 2 * dist * Math.tan(((PARA_FOV * Math.PI) / 180) / 2);
+  const aspect = window.innerWidth / window.innerHeight;
+  const visW = visH * aspect;
+  const worldPerPx = visW / window.innerWidth;
+  const em = PARA_FONT_PX * worldPerPx;
+  const scale = em / LETTER_SIZE; // glyphs are built at size = LETTER_SIZE = 1em
+  const colWidth = Math.min(PARA_COL_VW * visW, PARA_COL_MAX_PX * worldPerPx);
+  const lineH = PARA_LINE_EM * em;
+  // Center the middle line slightly above the frustum's vertical center.
+  const centerY = PARA_CAM_LOOK.y;
+  const topY = centerY + PARA_CENTER_BIAS * visH + lineH;
+  return { scale, colHalf: colWidth / 2, gap: PARA_GAP_EM * em, lineH, topY };
+}
+
 function makeParagraphView(): View {
   interface ParaWord {
     seqIndex: number;
@@ -472,41 +548,43 @@ function makeParagraphView(): View {
     end: number; // one past the last seq index on this line
     fade: number; // eased line-visibility factor
   }
+  let m = paraMetrics();
   let lines: ParaLine[] = [];
   let top = 0; // index of the top (active) visible line
   let packSeq = 0; // next seq index to pack into a new line
   let packIdx = 0; // next line index to create
 
   function rowY(lineIndex: number): number {
-    return PARA_TOP_Y - (lineIndex - top) * PARA_LINE_GAP;
+    return m.topY - (lineIndex - top) * m.lineH;
   }
 
-  // Greedily pack seq words into line `idx` up to PARA_LINE_WIDTH. A fresh line
-  // starts one row lower and transparent so it eases up and fades in from below.
+  // Greedily pack seq words into line `idx`: place each word immediately after
+  // the previous one with a consistent gap, wrapping to a new line when the next
+  // word would exceed the column. Ragged right — never justified.
   function createLine(idx: number): void {
     const g = new THREE.Group();
-    g.position.set(0, rowY(idx) - PARA_LINE_GAP, 0);
+    g.position.set(0, rowY(idx), 0);
     scene.add(g);
     const words: ParaWord[] = [];
     const start = packSeq;
     let s = packSeq;
-    let cursor = -PARA_LINE_WIDTH / 2;
+    let cursor = -m.colHalf; // left edge of the column
     for (;;) {
       if (settings.mode !== 'words') ensureSeq(s + 1);
       if (s >= seq.length) break;
-      const worldW = wordUnscaledWidth(seq[s]) * PARA_SCALE;
-      if (words.length > 0 && cursor + worldW > PARA_LINE_WIDTH / 2) break;
-      const { group, letters } = createWord(seq[s]);
-      group.scale.setScalar(PARA_SCALE);
+      const worldW = wordUnscaledWidth(seq[s]) * m.scale;
+      if (words.length > 0 && cursor + worldW > m.colHalf) break;
+      const { group, letters } = createWord(seq[s], false); // paragraph text casts no shadow
+      group.scale.setScalar(m.scale);
       group.position.set(cursor + worldW / 2, 0, 0);
       g.add(group);
-      words.push({ seqIndex: s, group, letters, opacity: 0.5 });
-      cursor += worldW + PARA_SPACE_WORLD;
+      words.push({ seqIndex: s, group, letters, opacity: OP_UPCOMING });
+      cursor += worldW + m.gap;
       s++;
     }
     packSeq = s;
     packIdx = idx + 1;
-    lines.push({ index: idx, group: g, words, start, end: s, fade: 0 });
+    lines.push({ index: idx, group: g, words, start, end: s, fade: idx < PARA_VISIBLE ? 1 : 0 });
   }
 
   function ensureLines(throughIdx: number): void {
@@ -520,28 +598,55 @@ function makeParagraphView(): View {
     return top;
   }
 
+  // Apply the state hierarchy: completed words sink to a quiet trail, upcoming
+  // words are muted gray, the active word is bright with its typed prefix in
+  // green / red. Colour only — opacity is eased per-frame in update().
   function paint(): void {
     for (const l of lines) {
       for (const w of l.words) {
-        const active = w.seqIndex === wordIndex;
-        w.opacity = w.seqIndex < wordIndex ? 0 : active ? 1 : OPACITY_UPCOMING;
-        for (let i = 0; i < w.letters.length; i++) {
-          if (active && i === letterIdx) markPending(w.letters[i]);
-          else if (active) markActive(w.letters[i]);
-          else markNormal(w.letters[i]);
+        if (w.seqIndex < wordIndex) {
+          w.opacity = OP_COMPLETED;
+          for (const ll of w.letters) setCompleted(ll);
+        } else if (w.seqIndex > wordIndex) {
+          w.opacity = OP_UPCOMING;
+          for (const ll of w.letters) setUpcoming(ll);
+        } else {
+          w.opacity = OP_CURRENT;
+          for (let i = 0; i < w.letters.length; i++) {
+            const ll = w.letters[i];
+            if (i < letterIdx) letterStates[i] === 'incorrect' ? setIncorrect(ll) : setCorrect(ll);
+            else setCurrentUntyped(ll);
+          }
         }
       }
     }
   }
 
-  // Build the opening window (active + upcoming lines).
-  ensureLines(PARA_VISIBLE - 1);
-  paint();
+  // Rebuild the whole line packing (used on first build and on resize). Preserves
+  // typing progress; paint() re-applies every letter's state afterwards.
+  function rebuild(): void {
+    for (const l of lines) {
+      for (const w of l.words) disposeWord(w.group, w.letters);
+      l.group.removeFromParent();
+    }
+    lines = [];
+    packSeq = 0;
+    packIdx = 0;
+    ensureLines(Math.max(PARA_VISIBLE - 1, 0));
+    top = lineIndexOf(wordIndex);
+    ensureLines(top + PARA_VISIBLE - 1);
+    // Snap lines straight to their resting rows so a resize doesn't animate.
+    for (const l of lines) l.group.position.y = rowY(l.index);
+    paint();
+  }
+
+  rebuild();
 
   return {
     camBase: PARA_CAM_BASE,
     camLook: PARA_CAM_LOOK,
     camFov: PARA_FOV,
+    lockCamera: true,
     currentWord() {
       for (const l of lines) {
         if (l.index !== top) continue;
@@ -561,26 +666,17 @@ function makeParagraphView(): View {
       paint();
     },
     update(dt: number) {
-      const now = performance.now();
       const posLerp = 1 - Math.pow(0.0009, dt);
       const opLerp = 1 - Math.pow(0.0025, dt);
       for (let i = lines.length - 1; i >= 0; i--) {
         const l = lines[i];
         const row = l.index - top;
-        const targetY = PARA_TOP_Y - row * PARA_LINE_GAP;
+        const targetY = m.topY - row * m.lineH;
         l.group.position.y = THREE.MathUtils.lerp(l.group.position.y, targetY, posLerp);
         const fadeTarget = row >= 0 && row < PARA_VISIBLE ? 1 : 0;
         l.fade = THREE.MathUtils.lerp(l.fade, fadeTarget, opLerp);
         for (const w of l.words) {
-          for (const ll of w.letters) {
-            if (ll.detached) continue;
-            if (ll.errorUntil) {
-              if (now < ll.errorUntil) continue;
-              ll.errorUntil = 0;
-              paint();
-            }
-            ll.mat.opacity = w.opacity * l.fade;
-          }
+          for (const ll of w.letters) ll.mat.opacity = w.opacity * l.fade;
         }
         // Retire a line once it has scrolled clear above the active line.
         if (row < 0 && l.fade < 0.02) {
@@ -590,6 +686,10 @@ function makeParagraphView(): View {
         }
       }
     },
+    relayout() {
+      m = paraMetrics();
+      rebuild();
+    },
     dispose() {
       for (const l of lines) {
         for (const w of l.words) disposeWord(w.group, w.letters);
@@ -598,7 +698,19 @@ function makeParagraphView(): View {
       lines = [];
     },
     info() {
-      return { view: 'paragraph', topLine: top, lines: lines.length };
+      const active = lines.find((l) => l.index === top);
+      return {
+        view: 'paragraph',
+        topLine: top,
+        lines: lines.length,
+        // Per-word line assignments and column geometry for test assertions.
+        colHalf: m.colHalf,
+        activeWords: active ? active.words.map((w) => w.seqIndex) : [],
+        rows: lines
+          .slice()
+          .sort((a, b) => a.index - b.index)
+          .map((l) => ({ index: l.index, y: +l.group.position.y.toFixed(3), words: l.words.map((w) => w.seqIndex) })),
+      };
     },
   };
 }
@@ -711,21 +823,9 @@ function beginIfNeeded() {
   }
 }
 
-function detachCurrent(effect: EffectId) {
-  const w = activeView.currentWord();
-  if (!w) return;
-  detachLetterMesh(w.letters[letterIdx], w.group, effect);
-}
-
-function flashError(idx: number) {
-  const w = activeView.currentWord();
-  if (!w) return;
-  const l = w.letters[idx];
-  if (!l) return;
-  l.errorUntil = performance.now() + 220;
-  l.mat.color.setHex(RED);
-  l.mat.emissive.setHex(RED);
-  l.mat.emissiveIntensity = 0.6;
+function allCurrentCorrect(): boolean {
+  for (const s of letterStates) if (s !== 'correct') return false;
+  return true;
 }
 
 function handleChar(ch: string) {
@@ -736,29 +836,56 @@ function handleChar(ch: string) {
   const w = activeView.currentWord();
   if (!w) return;
   const pending = w.letters[letterIdx];
-  if (!pending) return;
+  if (!pending) return; // word full and holding a mistake — wait for backspace
 
   beginIfNeeded();
 
   if (ch.toLowerCase() === pending.ch.toLowerCase()) {
-    detachCurrent(settings.effect);
+    // Correct: the original locks in green (holding its slot) and a clone blows
+    // away with the chosen effect — Typefall's signature, without reflow.
+    detachClone(pending, settings.effect);
+    pending.state = 'correct';
+    setCorrect(pending);
+    letterStates[letterIdx] = 'correct';
     state.correct++;
     letterIdx++;
-    if (letterIdx >= w.letters.length) {
-      completeWord();
-    } else {
-      activeView.paint();
-    }
+    if (letterIdx >= w.letters.length && allCurrentCorrect()) completeWord();
+    else activeView.paint();
   } else {
+    // Wrong: the letter turns red and the caret advances (monkeytype default);
+    // the word won't complete until the mistake is backspaced and corrected.
+    pending.state = 'incorrect';
+    setIncorrect(pending);
+    letterStates[letterIdx] = 'incorrect';
     state.incorrect++;
-    flashError(letterIdx);
-    addShake(0.32);
+    letterIdx++;
+    if (!activeView.lockCamera) addShake(0.32);
+    activeView.paint();
   }
+}
+
+// Monkeytype-style backspace, scoped to the current word: step the caret back
+// and restore that letter to an untyped state (a correct letter's clone has
+// already flown, but the original is still here to revert).
+function handleBackspace() {
+  if (state.phase === 'finished') return;
+  if (ui.isMenuOpen()) return;
+  if (letterIdx === 0) return; // don't reach back into finished words
+  const w = activeView.currentWord();
+  if (!w) return;
+  letterIdx--;
+  const undone = letterStates.pop();
+  if (undone === 'correct') state.correct = Math.max(0, state.correct - 1);
+  else if (undone === 'incorrect') state.incorrect = Math.max(0, state.incorrect - 1);
+  const l = w.letters[letterIdx];
+  if (l) l.state = 'untyped';
+  activeView.paint();
 }
 
 function completeWord() {
   state.correct++; // implicit space, keeps WPM honest
   state.wordsDone++;
+  letterStates = [];
   if (settings.mode === 'words' && state.wordsDone >= settings.words) {
     finish();
     return;
@@ -804,6 +931,7 @@ function restart() {
   ui.setHudVisible(true);
   wordIndex = 0;
   letterIdx = 0;
+  letterStates = [];
   newSequence();
   buildView();
   updateHud();
@@ -914,16 +1042,31 @@ window.addEventListener('keydown', (e) => {
     if (state.phase === 'finished') restart();
     return;
   }
+  if (e.key === 'Backspace') {
+    e.preventDefault();
+    handleBackspace();
+    return;
+  }
   if (e.key.length === 1 && e.key.charCodeAt(0) >= 32) {
     e.preventDefault();
     handleChar(e.key);
   }
 });
 
-capture.addEventListener('input', () => {
+// Mobile soft keyboards deliver characters through the capture input; a
+// deletion arrives as a deleteContentBackward input event.
+capture.addEventListener('input', (e) => {
+  if ((e as InputEvent).inputType === 'deleteContentBackward') {
+    handleBackspace();
+    capture.value = '';
+    return;
+  }
   const v = capture.value;
   for (const ch of v) if (ch.charCodeAt(0) >= 32) handleChar(ch);
   capture.value = '';
+});
+capture.addEventListener('keydown', (e) => {
+  if (e.key === 'Backspace') handleBackspace();
 });
 
 if (isTouch) {
@@ -943,6 +1086,42 @@ const clock = new THREE.Clock();
 let running = true;
 let hudAccum = 0;
 
+// Latest caret placement, surfaced through the debug handle for assertions.
+const caretState = { visible: false, x: 0, y: 0, z: 0 };
+
+// Place the caret exactly on the next-character boundary, computed from glyph
+// advances (never a fixed slab in front of a letter). It sits in the inter-letter
+// gap just left of the pending glyph, or just past the last glyph at word end.
+function updateCaret(now: number) {
+  const cur = activeView.currentWord();
+  if (!cur || state.phase === 'finished') {
+    caret.visible = false;
+    caretState.visible = false;
+    return;
+  }
+  const pending = cur.letters[letterIdx];
+  let localX: number;
+  if (pending) {
+    localX = pending.localX - pending.halfWidth - LETTER_SPACING * 0.5;
+  } else {
+    const last = cur.letters[cur.letters.length - 1];
+    if (!last) {
+      caret.visible = false;
+      caretState.visible = false;
+      return;
+    }
+    localX = last.localX + last.halfWidth + LETTER_SPACING * 0.5;
+  }
+  caret.visible = true;
+  cur.group.localToWorld(caret.position.set(localX, 0, 0));
+  caret.scale.setScalar(cur.group.scale.x);
+  (caret.material as THREE.MeshBasicMaterial).opacity = 0.55 + 0.35 * Math.sin(now / 130);
+  caretState.visible = true;
+  caretState.x = +caret.position.x.toFixed(3);
+  caretState.y = +caret.position.y.toFixed(3);
+  caretState.z = +caret.position.z.toFixed(3);
+}
+
 function update(dt: number) {
   world.step(1 / 60, dt, 3);
 
@@ -952,17 +1131,7 @@ function update(dt: number) {
 
   activeView.update(dt);
 
-  // Caret at the pending letter's left edge.
-  const cur = activeView.currentWord();
-  const pending = cur?.letters[letterIdx];
-  if (cur && pending && !pending.detached && state.phase !== 'finished') {
-    caret.visible = true;
-    cur.group.localToWorld(caret.position.set(pending.localX - pending.halfWidth - 0.16, 0, 0));
-    caret.scale.setScalar(cur.group.scale.x);
-    (caret.material as THREE.MeshBasicMaterial).opacity = 0.55 + 0.35 * Math.sin(now / 130);
-  } else {
-    caret.visible = false;
-  }
+  updateCaret(now);
 
   // Camera shake decay.
   shake.multiplyScalar(Math.pow(0.0025, dt));
@@ -1027,6 +1196,9 @@ window.addEventListener('resize', () => {
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  // Recompute the measured-flow layout for the new viewport without disturbing
+  // the running test (keeps wordIndex / letterIdx / per-letter states).
+  if (activeView) activeView.relayout();
 });
 
 // ---------------------------------------------------------------------------
@@ -1047,6 +1219,8 @@ function snapshot() {
     current: seq[wordIndex] ?? '',
     wordIndex,
     letterIdx,
+    letterStates: letterStates.slice(),
+    caret: { ...caretState },
     bodies: effects.fallCount,
     menuOpen: ui.isMenuOpen(),
     resultsShown: state.phase === 'finished',
@@ -1086,9 +1260,17 @@ function snapshot() {
   typeChar(c: string) {
     handleChar(c);
   },
+  backspace() {
+    handleBackspace();
+  },
   // Type a whole string (letters only); spaces are ignored as usual.
   typeWord(s: string) {
     for (const c of s) handleChar(c);
+  },
+  // Recompute the layout for the current viewport (as a resize would).
+  relayout() {
+    if (activeView) activeView.relayout();
+    return snapshot();
   },
   // The automation tab suspends rAF — drive frames manually.
   frame(dt = 1 / 60) {
