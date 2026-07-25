@@ -3,19 +3,32 @@ import * as THREE from 'three';
 import { FontLoader, type Font } from 'three/addons/loaders/FontLoader.js';
 import { TextGeometry } from 'three/addons/geometries/TextGeometry.js';
 import * as CANNON from 'cannon-es';
+import { buildSequence } from './words';
+import { loadSettings, saveSettings, type Settings, type EffectId } from './settings';
+import { EffectSystem } from './effects';
+import { createUI } from './ui';
 
 // ---------------------------------------------------------------------------
-// Config
+// A monkeytype-style typing test rendered inside a 3D scene. Upcoming words
+// float ahead as extruded 3D text; the current word is prominent, the next few
+// recede and dim. Each correct keystroke detaches that letter and fires the
+// selected completion effect. Wrong keys flash red, nudge the camera, and count
+// as errors (monkeytype "stop on letter").
 // ---------------------------------------------------------------------------
+
 const BG = 0x0a0a0a;
 const WHITE = 0xe8e8ea;
 const GREEN = 0x22c55e;
-const MAX_LETTERS = 120;
-const SPAWN_HEIGHT = 15;
-const LETTER_SIZE = 1.9;
-const FLOOR_Y = 0;
-const BRAND = 'gmsudo';
-const IDLE_MS = 6000;
+const RED = 0xef4444;
+
+const LETTER_SIZE = 1.55;
+const LETTER_SPACING = 0.16;
+const BASE_Y = 4.2;
+const Z_GAP = 5.4;
+const Y_RISE = 0.42;
+const SCALE_FALLOFF = 0.85;
+const WINDOW = 7; // visible upcoming words (including current)
+
 const isTouch = matchMedia('(hover: none) and (pointer: coarse)').matches;
 
 // ---------------------------------------------------------------------------
@@ -32,72 +45,28 @@ renderer.toneMappingExposure = 1.15;
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(BG);
+scene.fog = new THREE.Fog(BG, 26, 62);
 
-// Debug handle (harmless in prod): lets tooling inspect/render the scene.
-(window as unknown as { typefall: unknown }).typefall = {
-  get scene() { return scene; },
-  get renderer() { return renderer; },
-  get camera() { return camera; },
-  get world() { return world; },
-  get letters() { return letters; },
-  spawnLetter: (ch: string) => spawnLetter(ch),
-  // Deterministic settle helper for pixel testing: drop all live bodies into a
-  // tight pile at origin, step the physics world hard, then render.
-  settle(n = 60) {
-    for (const l of letters) {
-      if (l.fading) continue;
-      l.body.type = CANNON.Body.DYNAMIC;
-      l.body.wakeUp();
-      l.body.position.set((Math.random() - 0.5) * 6, 0.6 + Math.random() * 6, (Math.random() - 0.5) * 4);
-      l.body.velocity.set(0, -2, 0);
-    }
-    for (let i = 0; i < n * 8; i++) world.step(1 / 60);
-    for (const l of letters) {
-      const p = l.body.position;
-      l.mesh.position.set(p.x, p.y, p.z);
-      l.mesh.quaternion.set(l.body.quaternion.x, l.body.quaternion.y, l.body.quaternion.z, l.body.quaternion.w);
-    }
-    renderer.render(scene, camera);
-    return letters.filter((l) => !l.fading).length;
-  },
-};
-// Fog near-plane pushed well past the letter pile (which sits ~25-35 units
-// from the orbiting camera at radius 24). Keeps settled letters clear while
-// still fading the far edges of the 120-unit floor into the dark background.
-scene.fog = new THREE.Fog(BG, 48, 100);
-
-const camera = new THREE.PerspectiveCamera(48, window.innerWidth / window.innerHeight, 0.1, 200);
-const camTarget = new THREE.Vector3(0, 3.2, 0);
-// Orbit state (spherical around target)
-let camAngle = 0.5;
-let camElev = 0.32;
-const camRadius = 24;
-let autoOrbit = true;
+const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 200);
+const CAM_BASE = new THREE.Vector3(0, 5.6, 13.5);
+const CAM_LOOK = new THREE.Vector3(0, 4.0, -4);
+const shake = new THREE.Vector3();
 
 function applyCamera() {
-  const r = camRadius;
-  camera.position.set(
-    Math.sin(camAngle) * Math.cos(camElev) * r,
-    Math.sin(camElev) * r + 3.5,
-    Math.cos(camAngle) * Math.cos(camElev) * r
-  );
-  camera.lookAt(camTarget);
+  camera.position.copy(CAM_BASE).add(shake);
+  camera.lookAt(CAM_LOOK);
 }
 applyCamera();
 
 // ---------------------------------------------------------------------------
 // Lighting
 // ---------------------------------------------------------------------------
-// Hemisphere gives the whole floor area a soft ambient fill: brighter sky
-// tone plus a non-black ground bounce so faces not hit by the key still read.
 scene.add(new THREE.HemisphereLight(0x3a3a40, 0x16161a, 0.75));
-const ambient = new THREE.AmbientLight(0xffffff, 0.2);
-scene.add(ambient);
+scene.add(new THREE.AmbientLight(0xffffff, 0.22));
 
-const key = new THREE.DirectionalLight(0xffffff, 2.3);
-key.position.set(6, 16, 8);
-// Aim the key (and its shadow frustum) at the pile centre just above the floor.
-key.target.position.set(0, 1.5, 0);
+const key = new THREE.DirectionalLight(0xffffff, 2.2);
+key.position.set(5, 16, 12);
+key.target.position.set(0, 3, 0);
 scene.add(key.target);
 key.castShadow = true;
 key.shadow.mapSize.set(2048, 2048);
@@ -111,39 +80,33 @@ key.shadow.bias = -0.0004;
 key.shadow.radius = 4;
 scene.add(key);
 
-// Cool rim light from behind for edge definition
-const rim = new THREE.DirectionalLight(0x60a5fa, 0.9);
+const rim = new THREE.DirectionalLight(0x60a5fa, 0.8);
 rim.position.set(-10, 6, -12);
 scene.add(rim);
 
-// Subtle green fill so the terminal accent lives in the air a little
-const accentFill = new THREE.PointLight(GREEN, 0.5, 40, 2);
-accentFill.position.set(-4, 2, 6);
+const accentFill = new THREE.PointLight(GREEN, 0.5, 44, 2);
+accentFill.position.set(-4, 3, 8);
 scene.add(accentFill);
 
 // ---------------------------------------------------------------------------
 // Floor
 // ---------------------------------------------------------------------------
-const floorMat = new THREE.MeshStandardMaterial({
-  color: 0x101012,
-  roughness: 0.95,
-  metalness: 0.0,
-});
-const floor = new THREE.Mesh(new THREE.PlaneGeometry(120, 120), floorMat);
+const floor = new THREE.Mesh(
+  new THREE.PlaneGeometry(120, 120),
+  new THREE.MeshStandardMaterial({ color: 0x101012, roughness: 0.95, metalness: 0 }),
+);
 floor.rotation.x = -Math.PI / 2;
-floor.position.y = FLOOR_Y;
 floor.receiveShadow = true;
 scene.add(floor);
 
-// faint grid for depth, very muted
 const grid = new THREE.GridHelper(120, 60, 0x1b1b20, 0x141418);
-grid.position.y = FLOOR_Y + 0.01;
+grid.position.y = 0.01;
 (grid.material as THREE.Material).transparent = true;
 (grid.material as THREE.Material).opacity = 0.5;
 scene.add(grid);
 
 // ---------------------------------------------------------------------------
-// Physics world
+// Physics world (used by the fall + rain effects)
 // ---------------------------------------------------------------------------
 const world = new CANNON.World({ gravity: new CANNON.Vec3(0, -32, 0) });
 world.allowSleep = true;
@@ -155,438 +118,554 @@ const groundBody = new CANNON.Body({ type: CANNON.Body.STATIC, shape: new CANNON
 groundBody.quaternion.setFromEuler(-Math.PI / 2, 0, 0);
 world.addBody(groundBody);
 
-// Invisible containment walls so the pile stays roughly centred.
 function addWall(nx: number, nz: number, px: number, pz: number) {
   const b = new CANNON.Body({ type: CANNON.Body.STATIC, shape: new CANNON.Plane() });
   b.quaternion.setFromVectors(new CANNON.Vec3(0, 0, 1), new CANNON.Vec3(nx, 0, nz));
   b.position.set(px, 0, pz);
   world.addBody(b);
 }
-addWall(1, 0, -10, 0); // left
-addWall(-1, 0, 10, 0); // right
-addWall(0, 1, 0, -8); // back
-addWall(0, -1, 0, 8); // front
+addWall(1, 0, -11, 0);
+addWall(-1, 0, 11, 0);
+addWall(0, 1, 0, -6);
+addWall(0, -1, 0, 10);
+
+const effects = new EffectSystem({ scene, camera, world, mobile: isTouch });
 
 // ---------------------------------------------------------------------------
-// Letters
+// Letter geometry cache
 // ---------------------------------------------------------------------------
-interface Letter {
-  mesh: THREE.Mesh;
-  body: CANNON.Body;
-  born: number;
-  fading: boolean;
-  fadeStart: number;
+interface Glyph {
+  geo: TextGeometry;
+  half: CANNON.Vec3;
+  width: number;
 }
-
-const letters: Letter[] = [];
-const geomCache = new Map<string, { geo: TextGeometry; half: CANNON.Vec3 }>();
-const countEl = document.getElementById('count') as HTMLSpanElement;
-
+const glyphCache = new Map<string, Glyph>();
 let font: Font | null = null;
 
-function getGeometry(ch: string) {
-  let cached = geomCache.get(ch);
-  if (cached) return cached;
+function getGlyph(ch: string): Glyph {
+  let g = glyphCache.get(ch);
+  if (g) return g;
   const geo = new TextGeometry(ch, {
     font: font!,
     size: LETTER_SIZE,
-    depth: LETTER_SIZE * 0.42,
-    curveSegments: 6,
+    depth: LETTER_SIZE * 0.4,
+    curveSegments: 5,
     bevelEnabled: true,
-    bevelThickness: 0.04,
-    bevelSize: 0.03,
+    bevelThickness: 0.035,
+    bevelSize: 0.025,
     bevelSegments: 2,
   });
   geo.computeBoundingBox();
   const bb = geo.boundingBox!;
+  const w = bb.max.x - bb.min.x;
   const cx = (bb.max.x + bb.min.x) / 2;
   const cy = (bb.max.y + bb.min.y) / 2;
   const cz = (bb.max.z + bb.min.z) / 2;
-  geo.translate(-cx, -cy, -cz); // centre geometry on its own origin
+  geo.translate(-cx, -cy, -cz);
   geo.computeVertexNormals();
   const half = new CANNON.Vec3(
-    Math.max((bb.max.x - bb.min.x) / 2, 0.18),
-    Math.max((bb.max.y - bb.min.y) / 2, 0.18),
-    Math.max((bb.max.z - bb.min.z) / 2, 0.18)
+    Math.max(w / 2, 0.16),
+    Math.max((bb.max.y - bb.min.y) / 2, 0.16),
+    Math.max((bb.max.z - bb.min.z) / 2, 0.16),
   );
-  cached = { geo, half };
-  geomCache.set(ch, cached);
-  return cached;
+  g = { geo, half, width: Math.max(w, 0.4) };
+  glyphCache.set(ch, g);
+  return g;
 }
 
-let accentTick = 0;
+// ---------------------------------------------------------------------------
+// Caret
+// ---------------------------------------------------------------------------
+const caret = new THREE.Mesh(
+  new THREE.BoxGeometry(0.14, LETTER_SIZE * 1.15, 0.14),
+  new THREE.MeshBasicMaterial({ color: GREEN, transparent: true, opacity: 0.9 }),
+);
+caret.visible = false;
+scene.add(caret);
 
-function spawnLetter(ch: string, x = 0, opts: { accent?: boolean; impulse?: number } = {}) {
-  if (!font) return;
-  const printable = ch.length === 1 && ch.charCodeAt(0) >= 33;
-  if (!printable) return;
+// ---------------------------------------------------------------------------
+// Word stream
+// ---------------------------------------------------------------------------
+interface StreamLetter {
+  ch: string;
+  mesh: THREE.Mesh;
+  mat: THREE.MeshStandardMaterial;
+  localX: number;
+  halfWidth: number;
+  errorUntil: number;
+}
+interface StreamWord {
+  text: string;
+  group: THREE.Group;
+  letters: StreamLetter[];
+  targetSlot: number;
+}
 
-  const { geo, half } = getGeometry(ch);
+let seq: string[] = [];
+let wordIndex = 0; // index in seq of the current word
+let visible: StreamWord[] = [];
+let letterIdx = 0; // next letter to type in the current word
 
-  const accent = opts.accent ?? (++accentTick % 7 === 0);
-  const mat = new THREE.MeshStandardMaterial({
-    color: accent ? GREEN : WHITE,
-    roughness: 0.5,
-    // Near-zero metalness so faces stay diffusely lit (metal eats fill light
-    // and reads black when the environment is dark). A touch of emissive on
-    // white letters keeps settled faces off the floor's near-black value.
-    metalness: 0.02,
-    emissive: accent ? GREEN : WHITE,
-    emissiveIntensity: accent ? 0.32 : 0.06,
-    transparent: true,
-    opacity: 1,
+function slotPos(slot: number, out: THREE.Vector3): THREE.Vector3 {
+  return out.set(0, BASE_Y + slot * Y_RISE, -slot * Z_GAP);
+}
+function slotScale(slot: number): number {
+  return Math.pow(SCALE_FALLOFF, slot);
+}
+function slotOpacity(slot: number): number {
+  if (slot <= 0) return 1;
+  return THREE.MathUtils.clamp(0.5 * Math.pow(0.72, slot - 1), 0.1, 1);
+}
+
+function buildWord(text: string, initSlot: number): StreamWord {
+  const group = new THREE.Group();
+  slotPos(initSlot, group.position);
+  group.scale.setScalar(slotScale(initSlot));
+
+  const widths = [...text].map((c) => getGlyph(c).width);
+  const total = widths.reduce((a, b) => a + b, 0) + LETTER_SPACING * (text.length - 1);
+  let cursor = -total / 2;
+  const letters: StreamLetter[] = [];
+  [...text].forEach((ch, i) => {
+    const glyph = getGlyph(ch);
+    const mat = new THREE.MeshStandardMaterial({
+      color: WHITE,
+      roughness: 0.5,
+      metalness: 0.02,
+      emissive: WHITE,
+      emissiveIntensity: 0.08,
+      transparent: true,
+      opacity: 1,
+    });
+    const mesh = new THREE.Mesh(glyph.geo, mat);
+    mesh.castShadow = true;
+    const localX = cursor + widths[i] / 2;
+    mesh.position.set(localX, 0, 0);
+    group.add(mesh);
+    letters.push({ ch, mesh, mat, localX, halfWidth: widths[i] / 2, errorUntil: 0 });
+    cursor += widths[i] + LETTER_SPACING;
   });
-  const mesh = new THREE.Mesh(geo, mat);
-  mesh.castShadow = true;
-  mesh.receiveShadow = true;
 
-  const px = THREE.MathUtils.clamp(x + (Math.random() - 0.5) * 1.2, -8, 8);
-  const pz = (Math.random() - 0.5) * 4;
-  mesh.position.set(px, SPAWN_HEIGHT + Math.random() * 2, pz);
-  scene.add(mesh);
-
-  const body = new CANNON.Body({
-    mass: 1,
-    shape: new CANNON.Box(half),
-    position: new CANNON.Vec3(mesh.position.x, mesh.position.y, mesh.position.z),
-    sleepSpeedLimit: 0.6,
-    sleepTimeLimit: 1.2,
-    linearDamping: 0.02,
-    angularDamping: 0.06,
-  });
-  const imp = opts.impulse ?? 1;
-  body.velocity.set((Math.random() - 0.5) * 2 * imp, -2, (Math.random() - 0.5) * 2 * imp);
-  body.angularVelocity.set(
-    (Math.random() - 0.5) * 6,
-    (Math.random() - 0.5) * 6,
-    (Math.random() - 0.5) * 6
-  );
-  body.quaternion.setFromEuler(
-    Math.random() * Math.PI,
-    Math.random() * Math.PI,
-    Math.random() * Math.PI
-  );
-  world.addBody(body);
-
-  letters.push({ mesh, body, born: performance.now(), fading: false, fadeStart: 0 });
-  enforceCap();
-  updateCount();
+  scene.add(group);
+  return { text, group, letters, targetSlot: initSlot };
 }
 
-function updateCount() {
-  const live = letters.filter((l) => !l.fading).length;
-  countEl.textContent = String(live);
+function disposeWord(w: StreamWord) {
+  for (const l of w.letters) {
+    w.group.remove(l.mesh);
+    l.mat.dispose();
+  }
+  scene.remove(w.group);
 }
 
-function enforceCap() {
-  const live = letters.filter((l) => !l.fading);
-  if (live.length <= MAX_LETTERS) return;
-  const excess = live.length - MAX_LETTERS;
-  for (let i = 0; i < excess; i++) {
-    startFade(live[i]);
+function ensureSeq(n: number) {
+  while (seq.length < n) seq.push(...buildSequence(60));
+}
+
+function buildStream() {
+  for (const w of visible) disposeWord(w);
+  visible = [];
+  wordIndex = 0;
+  letterIdx = 0;
+  const count = Math.min(WINDOW, seq.length);
+  for (let s = 0; s < count; s++) visible.push(buildWord(seq[s], s));
+  paintCurrent();
+}
+
+function advanceWord() {
+  const gone = visible.shift();
+  if (gone) disposeWord(gone);
+  wordIndex++;
+  letterIdx = 0;
+
+  // Slide everyone forward one slot.
+  for (let k = 0; k < visible.length; k++) visible[k].targetSlot = k;
+
+  // Bring in a new word at the back if the sequence has one.
+  const backSeqIdx = wordIndex + WINDOW - 1;
+  if (settings.mode !== 'words') ensureSeq(backSeqIdx + 2);
+  if (backSeqIdx < seq.length) {
+    const w = buildWord(seq[backSeqIdx], WINDOW);
+    w.targetSlot = visible.length; // its slot after this push
+    visible.push(w);
+  }
+  paintCurrent();
+}
+
+// Highlight the pending letter of the current word green; reset the rest.
+function paintCurrent() {
+  const cur = visible[0];
+  if (!cur) {
+    caret.visible = false;
+    return;
+  }
+  for (let i = 0; i < cur.letters.length; i++) {
+    const l = cur.letters[i];
+    if (i === letterIdx) {
+      l.mat.color.setHex(GREEN);
+      l.mat.emissive.setHex(GREEN);
+      l.mat.emissiveIntensity = 0.55;
+    } else {
+      l.mat.color.setHex(WHITE);
+      l.mat.emissive.setHex(WHITE);
+      l.mat.emissiveIntensity = 0.08;
+    }
   }
 }
 
-function startFade(l: Letter) {
-  if (l.fading) return;
-  l.fading = true;
-  l.fadeStart = performance.now();
-}
-
-function disposeLetter(l: Letter) {
-  scene.remove(l.mesh);
-  (l.mesh.material as THREE.Material).dispose();
-  world.removeBody(l.body);
-}
-
-function clearAll() {
-  for (const l of letters) startFade(l);
-}
-
-// ---------------------------------------------------------------------------
-// Word buffer (for Enter "drop the word")
-// ---------------------------------------------------------------------------
-let word = '';
-
-function dropWord() {
-  if (!word) return;
-  const w = word;
-  word = '';
-  const span = Math.min(w.length, 8);
-  const startX = -span * 0.5;
-  [...w].forEach((ch, i) => {
-    setTimeout(() => spawnLetter(ch, startX + i, { impulse: 1.6 }), i * 40);
-  });
+// Detach the current pending letter and fire the chosen effect.
+function detachLetter(effect: EffectId) {
+  const cur = visible[0];
+  const l = cur.letters[letterIdx];
+  const mesh = l.mesh;
+  mesh.updateWorldMatrix(true, false);
+  const wp = new THREE.Vector3();
+  const wq = new THREE.Quaternion();
+  const ws = new THREE.Vector3();
+  mesh.matrixWorld.decompose(wp, wq, ws);
+  cur.group.remove(mesh);
+  scene.add(mesh);
+  mesh.position.copy(wp);
+  mesh.quaternion.copy(wq);
+  mesh.scale.setScalar(1);
+  l.mat.color.setHex(WHITE);
+  l.mat.emissive.setHex(WHITE);
+  l.mat.emissiveIntensity = 0.08;
+  l.mat.opacity = 1;
+  const glyph = getGlyph(l.ch);
+  effects.play(effect, mesh, { color: new THREE.Color(WHITE), half: glyph.half });
 }
 
 // ---------------------------------------------------------------------------
-// Input handling
+// Game state + stats
 // ---------------------------------------------------------------------------
-const capture = document.getElementById('capture') as HTMLInputElement;
+type Phase = 'ready' | 'running' | 'finished';
+const settings: Settings = loadSettings();
 
-function markActivity() {
-  lastActivity = performance.now();
-  stopIdle();
+const state = {
+  phase: 'ready' as Phase,
+  correct: 0,
+  incorrect: 0,
+  wordsDone: 0,
+  startTime: 0,
+  endTime: 0,
+};
+let best = Number(localStorage.getItem('typefall.best') || 0);
+
+function wordsTotal(): number {
+  return settings.mode === 'words' ? settings.words : 0;
+}
+function elapsedSec(): number {
+  if (state.phase === 'ready') return 0;
+  const end = state.phase === 'finished' ? state.endTime : performance.now();
+  return Math.max(0, (end - state.startTime) / 1000);
+}
+function liveWpm(): number {
+  const t = elapsedSec();
+  if (t <= 0) return 0;
+  return Math.round(state.correct / 5 / (t / 60));
+}
+function rawWpm(): number {
+  const t = elapsedSec();
+  if (t <= 0) return 0;
+  return Math.round((state.correct + state.incorrect) / 5 / (t / 60));
+}
+function accuracy(): number {
+  const total = state.correct + state.incorrect;
+  if (total === 0) return 100;
+  return Math.round((state.correct / total) * 100);
+}
+
+// ---------------------------------------------------------------------------
+// Input
+// ---------------------------------------------------------------------------
+function beginIfNeeded() {
+  if (state.phase === 'ready') {
+    state.phase = 'running';
+    state.startTime = performance.now();
+  }
 }
 
 function handleChar(ch: string) {
-  markActivity();
-  spawnLetter(ch);
-  word += ch;
-  if (word.length > 24) word = word.slice(-24);
+  if (state.phase === 'finished') return;
+  if (ui.isMenuOpen()) return;
+  if (ch === ' ') return; // spaces are implicit; never an error at boundaries
+
+  const cur = visible[0];
+  if (!cur) return;
+  const pending = cur.letters[letterIdx];
+  if (!pending) return;
+
+  beginIfNeeded();
+
+  if (ch.toLowerCase() === pending.ch.toLowerCase()) {
+    detachLetter(settings.effect);
+    state.correct++;
+    letterIdx++;
+    if (letterIdx >= cur.letters.length) {
+      completeWord();
+    } else {
+      paintCurrent();
+    }
+  } else {
+    state.incorrect++;
+    pending.errorUntil = performance.now() + 220;
+    pending.mat.color.setHex(RED);
+    pending.mat.emissive.setHex(RED);
+    pending.mat.emissiveIntensity = 0.6;
+    addShake(0.32);
+  }
 }
+
+function completeWord() {
+  state.correct++; // implicit space, keeps WPM honest
+  state.wordsDone++;
+  if (settings.mode === 'words' && state.wordsDone >= settings.words) {
+    finish();
+    return;
+  }
+  advanceWord();
+}
+
+function addShake(mag: number) {
+  shake.x += (Math.random() - 0.5) * mag * 2;
+  shake.y += (Math.random() - 0.5) * mag * 2;
+}
+
+// ---------------------------------------------------------------------------
+// Test lifecycle
+// ---------------------------------------------------------------------------
+function newSequence() {
+  if (settings.mode === 'words') seq = buildSequence(settings.words);
+  else seq = buildSequence(120);
+}
+
+function restart() {
+  state.phase = 'ready';
+  state.correct = 0;
+  state.incorrect = 0;
+  state.wordsDone = 0;
+  state.startTime = 0;
+  state.endTime = 0;
+  effects.reset();
+  shake.set(0, 0, 0);
+  ui.hideResults();
+  ui.closeMenu();
+  ui.setHudVisible(true);
+  newSequence();
+  buildStream();
+  updateHud();
+  if (isTouch) capture.focus({ preventScroll: true });
+}
+
+function finish() {
+  state.phase = 'finished';
+  state.endTime = performance.now();
+  const wpm = liveWpm();
+  if (wpm > best) {
+    best = wpm;
+    try {
+      localStorage.setItem('typefall.best', String(best));
+    } catch {
+      /* ignore */
+    }
+  }
+  ui.setHudVisible(false);
+  ui.showResults({
+    wpm,
+    acc: accuracy(),
+    raw: rawWpm(),
+    correct: state.correct,
+    incorrect: state.incorrect,
+    best,
+  });
+  rainResultLetters();
+}
+
+// Let a handful of letters rain down behind the results panel.
+function rainResultLetters() {
+  const chars = 'typefall'.split('');
+  for (let i = 0; i < chars.length; i++) {
+    const glyph = getGlyph(chars[i]);
+    const mat = new THREE.MeshStandardMaterial({
+      color: WHITE,
+      roughness: 0.5,
+      metalness: 0.02,
+      emissive: WHITE,
+      emissiveIntensity: 0.08,
+      transparent: true,
+      opacity: 1,
+    });
+    const mesh = new THREE.Mesh(glyph.geo, mat);
+    mesh.castShadow = true;
+    mesh.position.set((Math.random() - 0.5) * 12, 12 + Math.random() * 6, (Math.random() - 0.5) * 4);
+    scene.add(mesh);
+    effects.rain(mesh, { color: new THREE.Color(WHITE), half: glyph.half });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// UI wiring
+// ---------------------------------------------------------------------------
+const ui = createUI({
+  getSettings: () => settings,
+  applySettings: (patch) => {
+    Object.assign(settings, patch);
+    saveSettings(settings);
+    restart();
+  },
+  restart,
+  onMenuOpen: () => {},
+  onMenuClose: () => {
+    if (isTouch) capture.focus({ preventScroll: true });
+  },
+});
+
+// ---------------------------------------------------------------------------
+// Keyboard + mobile input
+// ---------------------------------------------------------------------------
+const capture = document.getElementById('capture') as HTMLInputElement;
 
 window.addEventListener('keydown', (e) => {
   if (e.metaKey || e.ctrlKey || e.altKey) return;
 
-  if (e.key === 'Enter') {
-    e.preventDefault();
-    markActivity();
-    dropWord();
+  if (ui.isMenuOpen()) {
+    if (ui.handleMenuKey(e.key)) e.preventDefault();
     return;
   }
-  if (e.key === 'Backspace') {
+
+  if (e.key === 'Tab') {
     e.preventDefault();
-    markActivity();
-    flickLast();
-    word = word.slice(0, -1);
+    if (state.phase === 'finished') restart();
+    else ui.openMenu();
     return;
   }
   if (e.key === 'Escape') {
     e.preventDefault();
-    markActivity();
-    clearAll();
+    ui.openMenu();
     return;
   }
-  if (e.key.length === 1 && e.key.charCodeAt(0) >= 33) {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    if (state.phase === 'finished') restart();
+    return;
+  }
+  if (e.key.length === 1 && e.key.charCodeAt(0) >= 32) {
+    e.preventDefault();
     handleChar(e.key);
   }
 });
 
-// Mobile soft keyboard sends characters through the hidden input.
 capture.addEventListener('input', () => {
   const v = capture.value;
-  for (const ch of v) {
-    if (ch.charCodeAt(0) >= 33) handleChar(ch);
-  }
+  for (const ch of v) if (ch.charCodeAt(0) >= 32) handleChar(ch);
   capture.value = '';
 });
 
-// Fling the most recently spawned, still-awake letter (Backspace).
-function flickLast() {
-  for (let i = letters.length - 1; i >= 0; i--) {
-    const l = letters[i];
-    if (l.fading) continue;
-    l.body.wakeUp();
-    l.body.velocity.set((Math.random() - 0.5) * 10, 9 + Math.random() * 4, (Math.random() - 0.5) * 10);
-    l.body.angularVelocity.set(
-      (Math.random() - 0.5) * 14,
-      (Math.random() - 0.5) * 14,
-      (Math.random() - 0.5) * 14
-    );
-    return;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Pointer: drag-to-orbit, or grab-and-throw a letter
-// ---------------------------------------------------------------------------
-const raycaster = new THREE.Raycaster();
-const pointer = new THREE.Vector2();
-const dragPlane = new THREE.Plane();
-const dragPoint = new THREE.Vector3();
-
-let mode: 'none' | 'orbit' | 'drag' = 'none';
-let grabbed: Letter | null = null;
-let lastPointer = { x: 0, y: 0 };
-let prevGrabPos = new THREE.Vector3();
-let grabVel = new THREE.Vector3();
-let movedDistance = 0;
-
-function setPointer(e: PointerEvent) {
-  pointer.x = (e.clientX / window.innerWidth) * 2 - 1;
-  pointer.y = -(e.clientY / window.innerHeight) * 2 + 1;
-}
-
-canvas.addEventListener('pointerdown', (e) => {
-  markActivity();
-  if (isTouch) capture.focus({ preventScroll: true });
-  setPointer(e);
-  lastPointer = { x: e.clientX, y: e.clientY };
-  movedDistance = 0;
-
-  raycaster.setFromCamera(pointer, camera);
-  const meshes = letters.filter((l) => !l.fading).map((l) => l.mesh);
-  const hit = raycaster.intersectObjects(meshes, false)[0];
-
-  if (hit) {
-    const l = letters.find((x) => x.mesh === hit.object)!;
-    grabbed = l;
-    mode = 'drag';
-    l.body.type = CANNON.Body.KINEMATIC;
-    l.body.velocity.setZero();
-    l.body.angularVelocity.setZero();
-    l.body.wakeUp();
-    // Drag plane faces camera, through the grab point.
-    dragPlane.setFromNormalAndCoplanarPoint(
-      camera.getWorldDirection(new THREE.Vector3()).negate(),
-      hit.point
-    );
-    prevGrabPos.copy(l.mesh.position);
-    grabVel.set(0, 0, 0);
-  } else {
-    mode = 'orbit';
-    autoOrbit = false;
-  }
-  canvas.setPointerCapture(e.pointerId);
-});
-
-canvas.addEventListener('pointermove', (e) => {
-  if (mode === 'none') return;
-  const dx = e.clientX - lastPointer.x;
-  const dy = e.clientY - lastPointer.y;
-  movedDistance += Math.abs(dx) + Math.abs(dy);
-  lastPointer = { x: e.clientX, y: e.clientY };
-
-  if (mode === 'orbit') {
-    camAngle -= dx * 0.005;
-    camElev = THREE.MathUtils.clamp(camElev + dy * 0.004, -0.05, 0.95);
-    applyCamera();
-  } else if (mode === 'drag' && grabbed) {
-    setPointer(e);
-    raycaster.setFromCamera(pointer, camera);
-    if (raycaster.ray.intersectPlane(dragPlane, dragPoint)) {
-      dragPoint.x = THREE.MathUtils.clamp(dragPoint.x, -9, 9);
-      dragPoint.y = Math.max(dragPoint.y, 0.6);
-      dragPoint.z = THREE.MathUtils.clamp(dragPoint.z, -7, 7);
-      grabVel.subVectors(dragPoint, prevGrabPos).multiplyScalar(9);
-      prevGrabPos.copy(dragPoint);
-      grabbed.body.position.set(dragPoint.x, dragPoint.y, dragPoint.z);
-      grabbed.body.velocity.set(grabVel.x, grabVel.y, grabVel.z);
-    }
-  }
-});
-
-function endPointer(e: PointerEvent) {
-  if (mode === 'drag' && grabbed) {
-    grabbed.body.type = CANNON.Body.DYNAMIC;
-    grabbed.body.wakeUp();
-    // Throw with the last drag velocity.
-    grabbed.body.velocity.set(grabVel.x, grabVel.y, grabVel.z);
-    grabbed.body.angularVelocity.set(
-      (Math.random() - 0.5) * 8,
-      (Math.random() - 0.5) * 8,
-      (Math.random() - 0.5) * 8
-    );
-    grabbed = null;
-  } else if (mode === 'orbit' && movedDistance < 6 && isTouch) {
-    // A tap on empty space (mobile): spawn a random brand letter.
-    spawnLetter(BRAND[Math.floor(Math.random() * BRAND.length)]);
-  }
-  mode = 'none';
-  try {
-    canvas.releasePointerCapture(e.pointerId);
-  } catch {
-    /* ignore */
-  }
-}
-canvas.addEventListener('pointerup', endPointer);
-canvas.addEventListener('pointercancel', endPointer);
-
-// Keep the hidden input focused on any tap so the mobile keyboard stays up.
 if (isTouch) {
-  window.addEventListener('touchstart', () => capture.focus({ preventScroll: true }), { passive: true });
-}
-
-// ---------------------------------------------------------------------------
-// Idle self-demo — type a phrase slowly until the user takes over.
-// ---------------------------------------------------------------------------
-let lastActivity = performance.now();
-let idleTimer: number | null = null;
-const idlePhrase = 'type something ' + BRAND;
-let idleIndex = 0;
-
-function stopIdle() {
-  if (idleTimer !== null) {
-    clearTimeout(idleTimer);
-    idleTimer = null;
-  }
-}
-
-function idleStep() {
-  if (performance.now() - lastActivity < IDLE_MS) {
-    scheduleIdle();
-    return;
-  }
-  const ch = idlePhrase[idleIndex % idlePhrase.length];
-  idleIndex++;
-  if (ch !== ' ') spawnLetter(ch);
-  scheduleIdle();
-}
-
-function scheduleIdle() {
-  stopIdle();
-  idleTimer = window.setTimeout(idleStep, 520);
+  const focusCapture = () => capture.focus({ preventScroll: true });
+  canvas.addEventListener('pointerdown', () => {
+    if (state.phase === 'finished') restart();
+    else focusCapture();
+  });
+  window.addEventListener('touchstart', focusCapture, { passive: true });
+  window.addEventListener('load', focusCapture, { once: true });
 }
 
 // ---------------------------------------------------------------------------
 // Loop
 // ---------------------------------------------------------------------------
 const clock = new THREE.Clock();
-const FADE_MS = 650;
 let running = true;
+let hudAccum = 0;
+const tmpVec = new THREE.Vector3();
 
-function step() {
-  const dt = Math.min(clock.getDelta(), 1 / 30);
+function update(dt: number) {
   world.step(1 / 60, dt, 3);
 
   const now = performance.now();
-  for (let i = letters.length - 1; i >= 0; i--) {
-    const l = letters[i];
-    const p = l.body.position;
-    l.mesh.position.set(p.x, p.y, p.z);
-    l.mesh.quaternion.set(
-      l.body.quaternion.x,
-      l.body.quaternion.y,
-      l.body.quaternion.z,
-      l.body.quaternion.w
-    );
 
-    if (l.fading) {
-      const t = (now - l.fadeStart) / FADE_MS;
-      const mat = l.mesh.material as THREE.MeshStandardMaterial;
-      mat.opacity = Math.max(0, 1 - t);
-      const s = Math.max(0.001, 1 - t * 0.4);
-      l.mesh.scale.setScalar(s);
-      if (t >= 1) {
-        disposeLetter(l);
-        letters.splice(i, 1);
-        updateCount();
+  // Ease each visible word toward its target slot → the stream flows in.
+  const lerp = 1 - Math.pow(0.0015, dt);
+  for (let k = 0; k < visible.length; k++) {
+    const w = visible[k];
+    slotPos(w.targetSlot, tmpVec);
+    w.group.position.lerp(tmpVec, lerp);
+    const ts = slotScale(w.targetSlot);
+    w.group.scale.setScalar(THREE.MathUtils.lerp(w.group.scale.x, ts, lerp));
+    const op = slotOpacity(w.targetSlot);
+    for (const l of w.letters) {
+      if (l.errorUntil) {
+        if (now < l.errorUntil) continue;
+        l.errorUntil = 0;
+        paintCurrent();
       }
-    } else if (p.y < -8) {
-      // Fell out of the world somehow — recycle.
-      disposeLetter(l);
-      letters.splice(i, 1);
-      updateCount();
+      l.mat.opacity = op;
     }
   }
 
-  // Gentle auto-orbit when the user isn't driving.
-  if (autoOrbit) {
-    camAngle += dt * 0.06;
-    applyCamera();
+  // Caret at the pending letter's left edge.
+  const cur = visible[0];
+  if (cur && state.phase !== 'finished' && cur.letters[letterIdx]) {
+    const l = cur.letters[letterIdx];
+    caret.visible = true;
+    cur.group.localToWorld(caret.position.set(l.localX - l.halfWidth - 0.16, 0, 0));
+    caret.scale.setScalar(cur.group.scale.x);
+    (caret.material as THREE.MeshBasicMaterial).opacity = 0.55 + 0.35 * Math.sin(now / 130);
+  } else {
+    caret.visible = false;
   }
 
+  // Camera shake decay.
+  shake.multiplyScalar(Math.pow(0.0025, dt));
+  applyCamera();
+
+  effects.update(dt);
+
+  // Time-mode finish.
+  if (state.phase === 'running' && settings.mode === 'time' && elapsedSec() >= settings.time) {
+    finish();
+  }
+
+  // Throttled HUD.
+  hudAccum += dt;
+  if (hudAccum > 0.1) {
+    hudAccum = 0;
+    updateHud();
+  }
+}
+
+function updateHud() {
+  let modeLabel = '';
+  let primary = '';
+  if (settings.mode === 'time') {
+    modeLabel = 'time';
+    const remain = Math.max(0, settings.time - elapsedSec());
+    primary = state.phase === 'ready' ? String(settings.time) : String(Math.ceil(remain));
+  } else if (settings.mode === 'words') {
+    modeLabel = 'words';
+    primary = `${state.wordsDone}/${settings.words}`;
+  } else {
+    modeLabel = 'zen';
+    primary = String(state.wordsDone);
+  }
+  const stats =
+    state.phase === 'ready' ? 'type to start' : `${liveWpm()} wpm · ${accuracy()}% acc`;
+  ui.setHud(modeLabel, primary, stats);
+}
+
+function render() {
   renderer.render(scene, camera);
 }
 
 function animate() {
   if (!running) return;
   requestAnimationFrame(animate);
-  step();
+  const dt = Math.min(clock.getDelta(), 1 / 30);
+  update(dt);
+  render();
 }
 
-// Pause when tab is hidden; resume cleanly.
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
     running = false;
@@ -604,26 +683,84 @@ window.addEventListener('resize', () => {
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 });
 
-// Re-enable auto-orbit after a stretch of no interaction.
-setInterval(() => {
-  if (performance.now() - lastActivity > IDLE_MS && !grabbed) autoOrbit = true;
-}, 2000);
+// ---------------------------------------------------------------------------
+// Debug / automation handle
+// ---------------------------------------------------------------------------
+function snapshot() {
+  return {
+    phase: state.phase,
+    wpm: liveWpm(),
+    raw: rawWpm(),
+    acc: accuracy(),
+    correct: state.correct,
+    incorrect: state.incorrect,
+    wordsDone: state.wordsDone,
+    wordsTotal: wordsTotal(),
+    elapsed: elapsedSec(),
+    current: visible[0]?.text ?? '',
+    letterIdx,
+    bodies: effects.fallCount,
+    menuOpen: ui.isMenuOpen(),
+    resultsShown: state.phase === 'finished',
+  };
+}
+
+(window as unknown as { typefall: unknown }).typefall = {
+  get scene() {
+    return scene;
+  },
+  get renderer() {
+    return renderer;
+  },
+  get camera() {
+    return camera;
+  },
+  get world() {
+    return world;
+  },
+  get settings() {
+    return settings;
+  },
+  get state() {
+    return snapshot();
+  },
+  // Apply overrides and reset to a fresh test. Timing starts on first typeChar.
+  startTest(opts: Partial<Settings> = {}) {
+    Object.assign(settings, opts);
+    saveSettings(settings);
+    restart();
+    return snapshot();
+  },
+  typeChar(c: string) {
+    handleChar(c);
+  },
+  // Type a whole string (letters only); spaces are ignored as usual.
+  typeWord(s: string) {
+    for (const c of s) handleChar(c);
+  },
+  // The automation tab suspends rAF — drive frames manually.
+  frame(dt = 1 / 60) {
+    update(dt);
+    render();
+  },
+  render,
+  reset: restart,
+  // Deterministic settle for pixel testing of the fall pile.
+  settle(n = 90) {
+    for (let i = 0; i < n; i++) update(1 / 60);
+    render();
+    return effects.fallCount;
+  },
+};
 
 // ---------------------------------------------------------------------------
 // Boot
 // ---------------------------------------------------------------------------
-new FontLoader().load(
-  `${import.meta.env.BASE_URL}fonts/helvetiker_bold.typeface.json`,
-  (loaded) => {
-    font = loaded;
-    animate();
-    // Kick off the self-demo shortly after load.
-    lastActivity = performance.now() - IDLE_MS + 900;
-    scheduleIdle();
-  }
-);
-
-if (isTouch) {
-  // Prime focus so the first tap reliably opens the keyboard.
-  window.addEventListener('load', () => capture.focus({ preventScroll: true }), { once: true });
-}
+new FontLoader().load(`${import.meta.env.BASE_URL}fonts/helvetiker_bold.typeface.json`, (loaded) => {
+  font = loaded;
+  newSequence();
+  buildStream();
+  updateHud();
+  animate();
+  if (isTouch) capture.focus({ preventScroll: true });
+});
