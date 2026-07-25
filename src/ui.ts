@@ -1,9 +1,12 @@
 import {
   type Settings,
   type ModeId,
+  type ViewId,
   type EffectId,
   TIME_OPTIONS,
   WORD_OPTIONS,
+  VIEW_OPTIONS,
+  VIEW_LABELS,
   EFFECT_OPTIONS,
   EFFECT_LABELS,
 } from './settings';
@@ -83,6 +86,12 @@ export function createUI(cb: UICallbacks) {
 
     const restart = opt('restart', 'p-restart', () => cb.restart());
     panel.appendChild(wrapRow('', [restart]));
+
+    // view
+    const viewBtns = VIEW_OPTIONS.map((v: ViewId) =>
+      opt(VIEW_LABELS[v], s.view === v ? 'sel' : '', () => cb.applySettings({ view: v })),
+    );
+    panel.appendChild(wrapRow('view', viewBtns));
 
     // mode
     const modeBtns = (['time', 'words', 'zen'] as ModeId[]).map((m) =>
