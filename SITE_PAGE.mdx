@@ -4,7 +4,7 @@ summary: "A monkeytype-style typing test rendered in 3D — the passage reads as
 tags: ["Three.js", "Physics", "Typing"]
 time:
   created: "2026-07-25T00:00:00.000Z"
-  updated: "2026-07-25T00:00:00.000Z"
+  updated: "2026-07-26T00:00:00.000Z"
 media:
   image: "/images/typefall-preview.png"
 pagesite:
@@ -46,9 +46,14 @@ and holds its slot so the passage never jumps — while a flying copy peels off
 and fires the completion effect you picked: it drops and piles on the floor,
 bursts into particles, dissolves into ash, spirals off, rockets up with a green
 trail, or shatters into shards. Miss a letter and it turns red and the caret
-moves on, monkeytype-style; backspace walks back through the current word and
-restores each letter, and the word won't complete until every character is
-right.
+moves on, monkeytype-style. A word finishes the instant you type its last letter
+right; if it's still holding a mistake, space is the advance — and any letters
+you skipped past are marked as errors, exactly like monkeytype. Backspace walks
+back through the current word restoring each letter, and steps into the previous
+word too when you left it imperfect, so you can go back and fix it. Finished
+words settle into a neutral gray while the word you're on stays bright, and
+accuracy counts every keystroke — a corrected mistake still costs you, like it
+should.
 
 There's a live WPM and accuracy readout — one quiet mono line, brighter while a
 test runs — three modes (timed 15/30/60s, a fixed 10/25/50 words, or endless

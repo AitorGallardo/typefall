@@ -28,6 +28,8 @@ const WHITE = 0xe8e8ea;
 const GREEN = 0x22c55e;
 const RED = 0xef4444;
 const GRAY = 0x878d99; // upcoming words — muted but comfortably readable on black
+const PAST = 0x6b7280; // completed words — neutral dim gray (monkeytype past-text)
+const PAST_RED = 0x9b5555; // completed-word mistakes / skips — a dimmed red tint
 
 const LETTER_SIZE = 1.55;
 const LETTER_SPACING = 0.1;
@@ -69,7 +71,9 @@ const PARA_COL_MAX_PX = 1000; // …capped to this many CSS px (centered)
 const PARA_GAP_EM = 0.55; // inter-word gap (~one normal space)
 const PARA_LINE_EM = 1.42; // line height
 const PARA_VISIBLE = 3; // rows shown at once (active + the next two)
-const PARA_CENTER_BIAS = 0.09; // push the block this fraction of view height above center
+const PARA_CENTER_BIAS = 0.05; // push the block this fraction of view height above center
+// (kept slight — the owner spec asks for "near visual center, slightly above if
+// necessary"; 0.05 keeps the block centered with fall room, not in the upper third)
 
 // --- per-view cameras (fov chosen per view; paragraph is flat/near-orthographic
 // so rows stay parallel and letters keep a uniform size — the "tool" feel) ---
@@ -231,10 +235,18 @@ function getGlyph(ch: string): Glyph {
 }
 
 // Unscaled width of a word (glyph units) — measured from the cache, no meshes.
+// Memoized per word: the paragraph re-packer calls this for every word on every
+// relayout, so caching keeps relayout independent of how many distinct words
+// have been measured.
+const wordWidthCache = new Map<string, number>();
 function wordUnscaledWidth(text: string): number {
+  const cached = wordWidthCache.get(text);
+  if (cached !== undefined) return cached;
   let w = 0;
   for (const ch of text) w += getGlyph(ch).width;
-  return w + LETTER_SPACING * (text.length - 1);
+  w += LETTER_SPACING * (text.length - 1);
+  wordWidthCache.set(text, w);
+  return w;
 }
 
 // ---------------------------------------------------------------------------
@@ -253,7 +265,7 @@ scene.add(caret);
 // ---------------------------------------------------------------------------
 // Shared word / letter primitives
 // ---------------------------------------------------------------------------
-type LetterState = 'untyped' | 'correct' | 'incorrect';
+type LetterState = 'untyped' | 'correct' | 'incorrect' | 'skipped';
 
 interface LayoutLetter {
   ch: string;
@@ -331,10 +343,20 @@ function setIncorrect(l: LayoutLetter) {
   l.mat.emissive.setHex(RED);
   l.mat.emissiveIntensity = EM_INCORRECT;
 }
+// Completed word, letter typed correctly — sinks to a neutral dim gray (the
+// monkeytype past-text look), not green. Only the active word's correct prefix
+// stays green; finished text recedes so the eye tracks the live word.
 function setCompleted(l: LayoutLetter) {
-  l.mat.color.setHex(GREEN);
-  l.mat.emissive.setHex(GREEN);
+  l.mat.color.setHex(PAST);
+  l.mat.emissive.setHex(PAST);
   l.mat.emissiveIntensity = EM_COMPLETED;
+}
+// Completed word, letter that was wrong or skipped — a dimmed red tint so past
+// mistakes stay visible without shouting over the live word.
+function setPastError(l: LayoutLetter) {
+  l.mat.color.setHex(PAST_RED);
+  l.mat.emissive.setHex(PAST_RED);
+  l.mat.emissiveIntensity = EM_COMPLETED + 0.04;
 }
 
 // Spawn a flying clone of a just-typed letter at its exact on-screen transform
@@ -377,6 +399,8 @@ interface View {
   currentWord(): { group: THREE.Group; letters: LayoutLetter[] } | null;
   paint(): void; // (re)apply highlight + dim state
   advance(): void; // move to the next word (scroll / slide)
+  retreat(): void; // step back to the previous word (backspace across a boundary)
+  boundaryGap(): number; // unscaled gap past the last glyph, for the word-end caret
   update(dt: number): void; // per-frame layout easing
   relayout(): void; // recompute layout for a new viewport (keeps progress)
   dispose(): void;
@@ -393,6 +417,12 @@ let letterIdx = 0; // cursor within the current word (chars committed, right or 
 // Per-char states of the letters already committed in the current word. Kept at
 // module scope so a viewport relayout can restore red/green after a rebuild.
 let letterStates: LetterState[] = [];
+// Per-word committed states of already-finished words, kept so backspace can step
+// back into an imperfect previous word and restore its letters for re-editing.
+let wordHistory: LetterState[][] = [];
+// Brief caret/word "pulse" (1 → 0) fired on an overflow keystroke so a full,
+// errored word visibly rejects extra input instead of silently swallowing it.
+let caretPulse = 0;
 let activeView: View;
 
 function ensureSeq(n: number) {
@@ -438,7 +468,7 @@ function makeStreamView(): View {
     if (!cur) return;
     for (let i = 0; i < cur.letters.length; i++) {
       const l = cur.letters[i];
-      if (i < letterIdx) letterStates[i] === 'incorrect' ? setIncorrect(l) : setCorrect(l);
+      if (i < letterIdx) letterStates[i] === 'correct' ? setCorrect(l) : setIncorrect(l);
       else setCurrentUntyped(l);
     }
   }
@@ -472,6 +502,22 @@ function makeStreamView(): View {
         visible.push(w);
       }
       paint();
+    },
+    // Backspace stepped across a word boundary: the just-completed word was
+    // disposed on advance, so rebuild it at the front slot (wordIndex has already
+    // been decremented) and drop the tail word to keep the window bounded.
+    retreat() {
+      if (visible.length >= WINDOW) {
+        const back = visible.pop();
+        if (back) disposeWord(back.group, back.letters);
+      }
+      const front = addWord(wordIndex, 0);
+      visible.unshift(front);
+      for (let k = 0; k < visible.length; k++) visible[k].targetSlot = k;
+      paint();
+    },
+    boundaryGap() {
+      return LETTER_SPACING;
     },
     update(dt: number) {
       const lerp = 1 - Math.pow(0.0015, dt);
@@ -527,9 +573,11 @@ function paraMetrics(): ParaMetrics {
   const scale = em / LETTER_SIZE; // glyphs are built at size = LETTER_SIZE = 1em
   const colWidth = Math.min(PARA_COL_VW * visW, PARA_COL_MAX_PX * worldPerPx);
   const lineH = PARA_LINE_EM * em;
-  // Center the middle line slightly above the frustum's vertical center.
+  // Center the visible block (its middle row) slightly above the frustum's
+  // vertical center. The top row sits (PARA_VISIBLE-1)/2 line-heights above the
+  // middle row, so the term generalizes with PARA_VISIBLE instead of assuming 3.
   const centerY = PARA_CAM_LOOK.y;
-  const topY = centerY + PARA_CENTER_BIAS * visH + lineH;
+  const topY = centerY + PARA_CENTER_BIAS * visH + (lineH * (PARA_VISIBLE - 1)) / 2;
   return { scale, colHalf: colWidth / 2, gap: PARA_GAP_EM * em, lineH, topY };
 }
 
@@ -588,7 +636,13 @@ function makeParagraphView(): View {
   }
 
   function ensureLines(throughIdx: number): void {
-    while (packIdx <= throughIdx) createLine(packIdx);
+    // In words mode the sequence is finite; stop once it is exhausted so we never
+    // manufacture trailing empty ParaLines past the last word. (time / zen extend
+    // the sequence lazily inside createLine, so there is always another word.)
+    while (packIdx <= throughIdx) {
+      if (settings.mode === 'words' && packSeq >= seq.length) break;
+      createLine(packIdx);
+    }
   }
 
   function lineIndexOf(seqIdx: number): number {
@@ -605,8 +659,12 @@ function makeParagraphView(): View {
     for (const l of lines) {
       for (const w of l.words) {
         if (w.seqIndex < wordIndex) {
+          // Past text: neutral dim gray, but keep wrong / skipped letters red-tinted.
           w.opacity = OP_COMPLETED;
-          for (const ll of w.letters) setCompleted(ll);
+          for (const ll of w.letters) {
+            if (ll.state === 'incorrect' || ll.state === 'skipped') setPastError(ll);
+            else setCompleted(ll);
+          }
         } else if (w.seqIndex > wordIndex) {
           w.opacity = OP_UPCOMING;
           for (const ll of w.letters) setUpcoming(ll);
@@ -614,7 +672,8 @@ function makeParagraphView(): View {
           w.opacity = OP_CURRENT;
           for (let i = 0; i < w.letters.length; i++) {
             const ll = w.letters[i];
-            if (i < letterIdx) letterStates[i] === 'incorrect' ? setIncorrect(ll) : setCorrect(ll);
+            // A committed letter is green only if correct; wrong or skipped is red.
+            if (i < letterIdx) letterStates[i] === 'correct' ? setCorrect(ll) : setIncorrect(ll);
             else setCurrentUntyped(ll);
           }
         }
@@ -622,19 +681,23 @@ function makeParagraphView(): View {
     }
   }
 
-  // Rebuild the whole line packing (used on first build and on resize). Preserves
-  // typing progress; paint() re-applies every letter's state afterwards.
+  // Rebuild the visible line packing (used on first build and on resize). Packs
+  // forward from the active word — the new top line begins at wordIndex — so the
+  // cost is O(PARA_VISIBLE) rather than O(wordIndex): a resize at word 500 no
+  // longer re-measures and rebuilds meshes for all 500 preceding words. Progress
+  // is preserved (wordIndex / letterIdx / per-letter states); paint() re-applies
+  // every letter's state afterwards. The active word re-anchors to the start of
+  // the top row, which only shows on the rare viewport resize.
   function rebuild(): void {
     for (const l of lines) {
       for (const w of l.words) disposeWord(w.group, w.letters);
       l.group.removeFromParent();
     }
     lines = [];
-    packSeq = 0;
+    packSeq = wordIndex;
     packIdx = 0;
-    ensureLines(Math.max(PARA_VISIBLE - 1, 0));
-    top = lineIndexOf(wordIndex);
-    ensureLines(top + PARA_VISIBLE - 1);
+    top = 0;
+    ensureLines(PARA_VISIBLE - 1);
     // Snap lines straight to their resting rows so a resize doesn't animate.
     for (const l of lines) l.group.position.y = rowY(l.index);
     paint();
@@ -664,6 +727,24 @@ function makeParagraphView(): View {
         ensureLines(top + PARA_VISIBLE - 1);
       }
       paint();
+    },
+    // Backspace stepped back across a word boundary. The previous word's line is
+    // still laid out (lines retire only after they scroll clear), so re-sync the
+    // top row to it and repaint. If it was already retired (only after a resize
+    // re-anchor), fall back to a rebuild.
+    retreat() {
+      const newTop = lineIndexOf(wordIndex);
+      if (newTop === top && !lines.some((l) => wordIndex >= l.start && wordIndex < l.end)) {
+        rebuild();
+        return;
+      }
+      top = newTop;
+      paint();
+    },
+    boundaryGap() {
+      // The inter-word gap is m.gap in world units; convert to the unscaled glyph
+      // units the caret offset works in (the word group is scaled by m.scale).
+      return m.scale > 0 ? m.gap / m.scale : LETTER_SPACING;
     },
     update(dt: number) {
       const posLerp = 1 - Math.pow(0.0009, dt);
@@ -807,6 +888,9 @@ function rawWpm(): number {
   if (t <= 0) return 0;
   return Math.round((state.correct + state.incorrect) / 5 / (t / 60));
 }
+// Honest accuracy, monkeytype-style: correct keystrokes over every keystroke of
+// the whole test. state.correct / state.incorrect are monotonic keystroke tallies
+// — backspacing a mistake never refunds it, so corrected errors still cost points.
 function accuracy(): number {
   const total = state.correct + state.incorrect;
   if (total === 0) return 100;
@@ -831,12 +915,22 @@ function allCurrentCorrect(): boolean {
 function handleChar(ch: string) {
   if (state.phase === 'finished') return;
   if (ui.isMenuOpen()) return;
-  if (ch === ' ') return; // spaces are implicit; never an error at boundaries
+  if (ch === ' ') return; // space is an advance, routed through handleSpace
 
   const w = activeView.currentWord();
   if (!w) return;
   const pending = w.letters[letterIdx];
-  if (!pending) return; // word full and holding a mistake — wait for backspace
+  if (!pending) {
+    // Word is full and holding at least one uncorrected error, so it did not
+    // auto-advance. Extra keystrokes here are overflow: count them as incorrect
+    // and fire a visible pulse — never silently swallow input (the old bug).
+    beginIfNeeded();
+    state.incorrect++;
+    caretPulse = 1;
+    if (!activeView.lockCamera) addShake(0.32);
+    activeView.paint();
+    return;
+  }
 
   beginIfNeeded();
 
@@ -864,27 +958,71 @@ function handleChar(ch: string) {
   }
 }
 
-// Monkeytype-style backspace, scoped to the current word: step the caret back
-// and restore that letter to an untyped state (a correct letter's clone has
-// already flown, but the original is still here to revert).
+// Monkeytype-style backspace. Within the current word it steps the caret back and
+// reverts the letter to untyped — but it never refunds a keystroke tally, so a
+// corrected mistake still costs accuracy. At the start of a word it steps back
+// into the previous word only if that word is imperfect (holds a wrong or skipped
+// letter), restoring its committed letters for re-editing; a perfect previous
+// word is left alone, exactly as monkeytype does.
 function handleBackspace() {
   if (state.phase === 'finished') return;
   if (ui.isMenuOpen()) return;
-  if (letterIdx === 0) return; // don't reach back into finished words
+
+  if (letterIdx === 0) {
+    if (wordIndex === 0) return;
+    const prev = wordHistory[wordIndex - 1];
+    const imperfect = !!prev && prev.some((s) => s === 'incorrect' || s === 'skipped');
+    if (!imperfect) return; // previous word was perfect — no-op
+
+    wordIndex--;
+    state.wordsDone = Math.max(0, state.wordsDone - 1);
+    // Counters stay put: the keystrokes that built the previous word (including
+    // its space) already happened and monkeytype never un-counts them.
+    letterStates = prev.slice();
+    letterIdx = prev.length;
+    delete wordHistory[wordIndex];
+    activeView.retreat();
+    const w = activeView.currentWord();
+    if (w) for (let i = 0; i < w.letters.length; i++) w.letters[i].state = letterStates[i] ?? 'untyped';
+    activeView.paint();
+    return;
+  }
+
   const w = activeView.currentWord();
   if (!w) return;
   letterIdx--;
-  const undone = letterStates.pop();
-  if (undone === 'correct') state.correct = Math.max(0, state.correct - 1);
-  else if (undone === 'incorrect') state.incorrect = Math.max(0, state.incorrect - 1);
+  letterStates.pop();
   const l = w.letters[letterIdx];
   if (l) l.state = 'untyped';
   activeView.paint();
 }
 
+// Space is the deliberate word-advance (monkeytype semantics). With no character
+// typed it is a no-op; otherwise it advances, marking any untyped remainder of the
+// current word as skipped errors (each costs a keystroke), and the word finishes
+// imperfect. A word that was already all-correct auto-advances on its last letter,
+// so space there simply falls through as a boundary no-op.
+function handleSpace() {
+  if (state.phase === 'finished') return;
+  if (ui.isMenuOpen()) return;
+  if (letterIdx === 0) return; // nothing typed yet — no-op
+  const w = activeView.currentWord();
+  if (!w) return;
+  beginIfNeeded();
+  for (let i = letterIdx; i < w.letters.length; i++) {
+    const l = w.letters[i];
+    l.state = 'skipped';
+    letterStates[i] = 'skipped';
+    state.incorrect++;
+  }
+  letterIdx = w.letters.length;
+  completeWord();
+}
+
 function completeWord() {
   state.correct++; // implicit space, keeps WPM honest
   state.wordsDone++;
+  wordHistory[wordIndex] = letterStates.slice(); // remember for backspace-into-previous
   letterStates = [];
   if (settings.mode === 'words' && state.wordsDone >= settings.words) {
     finish();
@@ -932,6 +1070,8 @@ function restart() {
   wordIndex = 0;
   letterIdx = 0;
   letterStates = [];
+  wordHistory = [];
+  caretPulse = 0;
   newSequence();
   buildView();
   updateHud();
@@ -1047,6 +1187,11 @@ window.addEventListener('keydown', (e) => {
     handleBackspace();
     return;
   }
+  if (e.key === ' ') {
+    e.preventDefault();
+    handleSpace();
+    return;
+  }
   if (e.key.length === 1 && e.key.charCodeAt(0) >= 32) {
     e.preventDefault();
     handleChar(e.key);
@@ -1062,7 +1207,10 @@ capture.addEventListener('input', (e) => {
     return;
   }
   const v = capture.value;
-  for (const ch of v) if (ch.charCodeAt(0) >= 32) handleChar(ch);
+  for (const ch of v) {
+    if (ch === ' ') handleSpace();
+    else if (ch.charCodeAt(0) >= 32) handleChar(ch);
+  }
   capture.value = '';
 });
 capture.addEventListener('keydown', (e) => {
@@ -1102,6 +1250,8 @@ function updateCaret(now: number) {
   const pending = cur.letters[letterIdx];
   let localX: number;
   if (pending) {
+    // Between letters the real gap is LETTER_SPACING, so half of it lands the
+    // caret cleanly in the inter-glyph gap just left of the pending letter.
     localX = pending.localX - pending.halfWidth - LETTER_SPACING * 0.5;
   } else {
     const last = cur.letters[cur.letters.length - 1];
@@ -1110,12 +1260,17 @@ function updateCaret(now: number) {
       caretState.visible = false;
       return;
     }
-    localX = last.localX + last.halfWidth + LETTER_SPACING * 0.5;
+    // At word end the gap to the next word is the view's boundary gap (m.gap in
+    // the paragraph, a slot gap in the stream), not the intra-word spacing.
+    localX = last.localX + last.halfWidth + activeView.boundaryGap() * 0.5;
   }
   caret.visible = true;
   cur.group.localToWorld(caret.position.set(localX, 0, 0));
-  caret.scale.setScalar(cur.group.scale.x);
-  (caret.material as THREE.MeshBasicMaterial).opacity = 0.55 + 0.35 * Math.sin(now / 130);
+  // A pulse briefly swells and reddens the caret so overflow input is felt.
+  const pulse = caretPulse;
+  caret.scale.setScalar(cur.group.scale.x * (1 + 0.6 * pulse));
+  (caret.material as THREE.MeshBasicMaterial).color.setHex(pulse > 0.05 ? RED : GREEN);
+  (caret.material as THREE.MeshBasicMaterial).opacity = Math.min(1, 0.55 + 0.35 * Math.sin(now / 130) + 0.45 * pulse);
   caretState.visible = true;
   caretState.x = +caret.position.x.toFixed(3);
   caretState.y = +caret.position.y.toFixed(3);
@@ -1133,8 +1288,9 @@ function update(dt: number) {
 
   updateCaret(now);
 
-  // Camera shake decay.
+  // Camera shake + caret-pulse decay.
   shake.multiplyScalar(Math.pow(0.0025, dt));
+  if (caretPulse > 0) caretPulse = Math.max(0, caretPulse - dt * 4);
   applyCamera();
 
   effects.update(dt);
@@ -1191,14 +1347,22 @@ document.addEventListener('visibilitychange', () => {
   }
 });
 
+// The renderer/camera resize is cheap and must track the viewport instantly so
+// the canvas never stretches; the measured-flow relayout is heavier, so it is
+// debounced (trailing) — a drag-resize fires one relayout when the drag settles
+// rather than one per intermediate size.
+let relayoutTimer: number | undefined;
 window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-  // Recompute the measured-flow layout for the new viewport without disturbing
-  // the running test (keeps wordIndex / letterIdx / per-letter states).
-  if (activeView) activeView.relayout();
+  clearTimeout(relayoutTimer);
+  // Recompute the layout for the new viewport without disturbing the running
+  // test (keeps wordIndex / letterIdx / per-letter states).
+  relayoutTimer = window.setTimeout(() => {
+    if (activeView) activeView.relayout();
+  }, 150);
 });
 
 // ---------------------------------------------------------------------------
@@ -1260,12 +1424,15 @@ function snapshot() {
   typeChar(c: string) {
     handleChar(c);
   },
+  space() {
+    handleSpace();
+  },
   backspace() {
     handleBackspace();
   },
-  // Type a whole string (letters only); spaces are ignored as usual.
+  // Type a whole string; embedded spaces advance the word like a real keypress.
   typeWord(s: string) {
-    for (const c of s) handleChar(c);
+    for (const c of s) c === ' ' ? handleSpace() : handleChar(c);
   },
   // Recompute the layout for the current viewport (as a resize would).
   relayout() {

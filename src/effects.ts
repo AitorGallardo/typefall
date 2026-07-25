@@ -70,6 +70,13 @@ export class EffectSystem {
   // Physics fall letters -------------------------------------------------
   private fall: FallLetter[] = [];
   private fallCap: number;
+  // A pathological instant burst (e.g. a scripted 50-key paste in one frame)
+  // must not spawn 50 physics bodies at once. Cap new fall bodies per frame and
+  // queue the overflow to later frames; the queue itself is bounded so a runaway
+  // burst degrades to dropping (disposing) clones rather than growing without end.
+  private fallPerFrame: number;
+  private fallQueue: { mesh: THREE.Mesh; opts: PlayOpts }[] = [];
+  private fallSpawnedThisFrame = 0;
 
   private surpriseTick = 0;
   private mobile: boolean;
@@ -87,6 +94,7 @@ export class EffectSystem {
 
     this.pCount = opts.mobile ? 1200 : 3500;
     this.fallCap = opts.mobile ? 70 : 150;
+    this.fallPerFrame = opts.mobile ? 4 : 8;
     this.pPos = new Float32Array(this.pCount * 3);
     this.pCol = new Float32Array(this.pCount * 3);
     this.pVel = new Float32Array(this.pCount * 3);
@@ -143,6 +151,15 @@ export class EffectSystem {
   // --- effects ----------------------------------------------------------
 
   private doFall(mesh: THREE.Mesh, opts: PlayOpts): void {
+    // Throttle body creation: past this frame's budget, defer to the queue (or
+    // drop the clone if even the queue is saturated) so one giant burst can't
+    // stall the frame spinning up dozens of rigid bodies at once.
+    if (this.fallSpawnedThisFrame >= this.fallPerFrame) {
+      if (this.fallQueue.length < this.fallCap * 2) this.fallQueue.push({ mesh, opts });
+      else this.removeMesh(mesh);
+      return;
+    }
+    this.fallSpawnedThisFrame++;
     const p = mesh.position;
     const body = new CANNON.Body({
       mass: 1,
@@ -313,6 +330,13 @@ export class EffectSystem {
   // --- per-frame update -------------------------------------------------
 
   update(dt: number): void {
+    // New frame: reset the per-frame spawn budget and drain any queued clones up
+    // to it (each doFall here re-increments the counter).
+    this.fallSpawnedThisFrame = 0;
+    while (this.fallQueue.length > 0 && this.fallSpawnedThisFrame < this.fallPerFrame) {
+      const q = this.fallQueue.shift()!;
+      this.doFall(q.mesh, q.opts);
+    }
     this.stepParticles(dt);
     this.stepShards(dt);
     this.stepAnims(dt);
@@ -476,6 +500,9 @@ export class EffectSystem {
 
   /** Wipe everything — used on restart. */
   reset(): void {
+    for (const q of this.fallQueue) this.removeMesh(q.mesh);
+    this.fallQueue.length = 0;
+    this.fallSpawnedThisFrame = 0;
     for (const f of this.fall) this.disposeFall(f);
     this.fall.length = 0;
     for (const a of this.anims) this.removeMesh(a.mesh);

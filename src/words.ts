@@ -23,26 +23,35 @@ const SEED: string[] = [
 ];
 
 // Verbs that take regular -s / -ed / -ing forms cleanly (no doubling/e-drop
-// surprises), used to grow the pool without spelling glitches.
+// surprises), used to grow the pool without spelling glitches. Irregulars whose
+// past tense is not -ed (keep→kept, stand→stood, build→built) are deliberately
+// excluded so the -ed derivation never manufactures a non-word like "keeped".
 const REGULAR_VERBS = [
   'work', 'call', 'look', 'want', 'need', 'help', 'play', 'talk', 'turn', 'show',
-  'watch', 'follow', 'start', 'keep', 'point', 'stand', 'build', 'clean',
+  'watch', 'follow', 'start', 'point', 'clean',
 ];
 
-// Nouns that pluralize with a plain -s.
+// Nouns that pluralize with a sibilant-aware -s / -es.
 const PLURAL_NOUNS = [
   'thing', 'year', 'word', 'book', 'room', 'group', 'point', 'reason', 'idea',
   'game', 'line', 'field', 'river', 'stone', 'plant', 'color', 'level', 'dream',
 ];
 
+// English -s / -es rule: words ending in a sibilant (s, x, z, ch, sh) take -es
+// (watch→watches), everything else a plain -s. Keeps the derivation from emitting
+// "watchs".
+function addS(word: string): string {
+  return /(?:s|x|z|ch|sh)$/.test(word) ? word + 'es' : word + 's';
+}
+
 function buildPool(): string[] {
   const set = new Set<string>(SEED);
   for (const v of REGULAR_VERBS) {
-    set.add(v + 's');
+    set.add(addS(v));
     set.add(v + 'ed');
     set.add(v + 'ing');
   }
-  for (const n of PLURAL_NOUNS) set.add(n + 's');
+  for (const n of PLURAL_NOUNS) set.add(addS(n));
   return [...set];
 }
 
