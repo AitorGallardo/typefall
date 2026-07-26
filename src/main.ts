@@ -8,16 +8,23 @@ import { buildSequence } from './words';
 import { loadSettings, saveSettings, type Settings, type EffectId } from './settings';
 import { EffectSystem } from './effects';
 import { createUI } from './ui';
+import { ResultsPanel, paintElementToCtx } from './resultsPanel';
+import { detectHtmlInCanvas } from './htmlCanvas';
 
 // ---------------------------------------------------------------------------
-// A monkeytype-style typing test rendered inside a 3D scene. Two presentations
+// A monkeytype-style typing test rendered inside a 3D scene. Three presentations
 // share the same scoring, effects and input:
-//   • paragraph (default) — the reading surface is flat SDF text (troika-three-
-//     text, JetBrains Mono): crisp, calm, tool-like. A measured-flow layout
-//     engine places words by their real monospace glyph advances into a centered
-//     column and shows three lines at once; the active word is bright with a thin
-//     green caret that smoothly lerps + blinks, upcoming words are muted, typed
-//     letters turn green, mistakes red, and finished lines scroll up.
+//   • crawl (default) — the same measured-flow lines, presented as a Star Wars
+//     opening crawl: the text plane tilts back and the lines climb it continuously
+//     toward a horizon fade, typed as they travel. A word that crosses the miss
+//     line still untyped is auto-missed (skipped-error semantics) and dissolves.
+//     A speed setting (0.8x–1.6x, or an auto WPM rubber-band) sets the climb rate.
+//   • paragraph — the reading surface is flat SDF text (troika-three-text,
+//     JetBrains Mono): crisp, calm, tool-like. A measured-flow layout engine
+//     places words by their real monospace glyph advances into a centered column
+//     and shows three lines at once; the active word is bright with a thin green
+//     caret that smoothly lerps + blinks, upcoming words are muted, typed letters
+//     turn green, mistakes red, and finished lines scroll up.
 //   • stream — upcoming words fly in from the background as chunky extruded 3D
 //     letters; the current word sits up front and the next few recede and dim.
 // Each correct keystroke locks the flat letter in place (green) and detaches a
@@ -96,6 +103,44 @@ const STREAM_FOV = 50;
 const PARA_CAM_BASE = new THREE.Vector3(0, 3.6, 30);
 const PARA_CAM_LOOK = new THREE.Vector3(0, 3.6, 0);
 const PARA_FOV = 28;
+
+// --- crawl view (a Star Wars opening crawl over the paragraph flow engine) ---
+// The reading surface is a plane tilted back about X so it vanishes upward; the
+// packed measured-flow lines climb it continuously toward a horizon fade. The
+// active line is the nearest/lowest and is typed as it travels; any word that
+// crosses the miss line still untyped is auto-missed (skipped-error semantics)
+// and dissolves. Perspective does the shrinking-toward-horizon for free — we only
+// scroll the lines up-plane and fade opacity with distance.
+const CRAWL_TILT = 0.55; // ~31° back-tilt of the text plane
+const CRAWL_CAM_BASE = new THREE.Vector3(0, 3.7, 14.5);
+const CRAWL_CAM_LOOK = new THREE.Vector3(0, 1.4, -3);
+const CRAWL_FOV = 52;
+// Layout on the tilted plane, in plane-local world units (viewport-independent —
+// the crawl is a stylized view, so sizing is world-based, not px-measured).
+const CRAWL_EM = 0.7; // glyph world height on the plane
+const CRAWL_COL_HALF = 7.6; // half the reading-column width (~6 words/line)
+const CRAWL_LINE_EM = 1.5; // line height as a multiple of em
+// Plane-local Y of the key reference lines, expressed in line-heights. Lines
+// climb from ENTER (nearest, below) up past MISS (~60% up the visible plane) to
+// HORIZON (fully faded, retired).
+const CRAWL_ENTER_LINEH = -1.6;
+const CRAWL_MISS_LINEH = 2.6;
+const CRAWL_HORIZON_LINEH = 7.5;
+const CRAWL_VISIBLE_AHEAD = 5; // lookahead lines packed below the active line
+// Climb rate. Numeric speed options multiply the base lines/second; 'auto' runs
+// a proportional controller that rubber-bands to the player's rolling WPM.
+const CRAWL_BASE_LPS = 0.16; // lines/second at 1x
+const CRAWL_SPEED_FACTORS: Record<string, number> = {
+  '0.8': 0.8,
+  '1': 1,
+  '1.25': 1.25,
+  '1.6': 1.6,
+};
+const CRAWL_AVG_WPL = 6; // approx words per packed line (auto pace → line rate)
+const CRAWL_AUTO_CHASE = 0.9; // keep the miss line just behind the true pace
+const CRAWL_AUTO_MIN = 0.06; // lines/second clamp — never fully stall
+const CRAWL_AUTO_MAX = 0.5; // lines/second clamp — never run away
+const CRAWL_AUTO_TAU = 1.5; // controller smoothing time constant (s)
 
 const isTouch = matchMedia('(hover: none) and (pointer: coarse)').matches;
 
@@ -491,6 +536,7 @@ interface View {
   readonly camLook: THREE.Vector3;
   readonly camFov: number;
   readonly lockCamera: boolean; // true → the reading surface never drifts (no shake)
+  readonly tiltX: number; // caret pitch to match a tilted reading plane (0 = flat)
   info(): Record<string, unknown>;
 }
 
@@ -507,6 +553,14 @@ let wordHistory: LetterState[][] = [];
 // errored word visibly rejects extra input instead of silently swallowing it.
 let caretPulse = 0;
 let activeView: View;
+
+// Crawl climb rate (lines/second), shared across the crawl view instance and the
+// speed controller. In 'auto' it rubber-bands to the player's rolling WPM; on a
+// fixed speed it is simply the base rate times the chosen multiplier.
+let currentSpeed = CRAWL_BASE_LPS;
+// Frame-clock timestamps of correct keystrokes, for the 10s rolling-WPM window
+// that drives the auto controller. Trimmed to the window each read.
+let wpmSamples: number[] = [];
 
 function ensureSeq(n: number) {
   while (seq.length < n) seq.push(...buildSequence(60));
@@ -566,6 +620,7 @@ function makeStreamView(): View {
     camLook: STREAM_CAM_LOOK,
     camFov: STREAM_FOV,
     lockCamera: false,
+    tiltX: 0,
     currentWord() {
       const cur = visible[0];
       return cur ? { group: cur.group, letters: cur.letters } : null;
@@ -810,6 +865,7 @@ function makeParagraphView(): View {
     camLook: PARA_CAM_LOOK,
     camFov: PARA_FOV,
     lockCamera: true,
+    tiltX: 0,
     currentWord() {
       for (const l of lines) {
         if (l.index !== top) continue;
@@ -903,6 +959,278 @@ function makeParagraphView(): View {
 }
 
 // ---------------------------------------------------------------------------
+// Crawl view — the paragraph flow engine presented as a Star Wars opening crawl.
+// The packed measured-flow lines live on a plane tilted back about X and climb it
+// continuously (time-driven, not keystroke-driven) toward a horizon fade. The
+// active word is typed as its line travels up; any word still untyped when its
+// line crosses the miss line (~60% up) is auto-missed with the existing
+// skipped-error semantics and dissolves. Perspective shrinks distant lines for
+// free — per frame we only translate line groups up-plane and fade opacity, so
+// the work stays transforms + colours. A sparse starfield sits behind, crawl-only.
+// ---------------------------------------------------------------------------
+interface CrawlMetrics {
+  em: number;
+  advance: number;
+  colHalf: number;
+  gap: number;
+  lineH: number;
+}
+function crawlMetrics(): CrawlMetrics {
+  const em = CRAWL_EM;
+  return {
+    em,
+    advance: em * MONO_ADVANCE,
+    colHalf: CRAWL_COL_HALF,
+    gap: PARA_GAP_EM * em,
+    lineH: CRAWL_LINE_EM * em,
+  };
+}
+
+function makeStarfield(): THREE.Points {
+  // Very sparse, dim points parked behind the plane. Tiny, no additive blending,
+  // no glow — restrained backdrop, drifted slowly for a parallax whisper.
+  const n = isTouch ? 160 : 320;
+  const pos = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) {
+    pos[i * 3] = (Math.random() - 0.5) * 140;
+    pos[i * 3 + 1] = -8 + Math.random() * 70;
+    pos[i * 3 + 2] = -30 - Math.random() * 120;
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  const mat = new THREE.PointsMaterial({
+    color: 0x8a8f99,
+    size: 0.16,
+    sizeAttenuation: true,
+    transparent: true,
+    opacity: 0.5,
+    depthWrite: false,
+    fog: false,
+  });
+  const pts = new THREE.Points(geo, mat);
+  pts.frustumCulled = false;
+  pts.renderOrder = -1;
+  return pts;
+}
+
+function makeCrawlView(): View {
+  interface CrawlWord {
+    seqIndex: number;
+    group: THREE.Group;
+    letters: LayoutLetter[];
+    opacity: number;
+  }
+  interface CrawlLine {
+    index: number;
+    group: THREE.Group;
+    words: CrawlWord[];
+    start: number;
+    end: number;
+  }
+
+  const m = crawlMetrics();
+  const root = new THREE.Group();
+  root.rotation.x = -CRAWL_TILT; // tilt the plane back so it vanishes upward
+  scene.add(root);
+  const stars = makeStarfield();
+  scene.add(stars);
+
+  let lines: CrawlLine[] = [];
+  let scroll = 0; // continuous climb progress, in line-heights
+  let packSeq = 0;
+  let packIdx = 0;
+
+  const missWorldY = CRAWL_MISS_LINEH * m.lineH;
+  const horizonWorldY = CRAWL_HORIZON_LINEH * m.lineH;
+  function rowY(li: number): number {
+    return (scroll - li) * m.lineH;
+  }
+  // Fade with distance up the plane (fog-like): full up to the miss line, easing
+  // to nothing by the horizon. Colour is untouched (troika glyphs are unlit).
+  function fadeFor(y: number): number {
+    if (y <= missWorldY) return 1;
+    return THREE.MathUtils.clamp(1 - (y - missWorldY) / (horizonWorldY - missWorldY), 0, 1);
+  }
+
+  function createLine(idx: number): void {
+    const g = new THREE.Group();
+    g.position.set(0, rowY(idx), 0);
+    root.add(g);
+    const words: CrawlWord[] = [];
+    const start = packSeq;
+    let s = packSeq;
+    let cursor = -m.colHalf;
+    for (;;) {
+      if (settings.mode !== 'words') ensureSeq(s + 1);
+      if (s >= seq.length) break;
+      const worldW = m.advance * seq[s].length;
+      if (words.length > 0 && cursor + worldW > m.colHalf) break;
+      const { group, letters } = createTroikaWord(seq[s], m.em, m.advance);
+      group.position.set(cursor + worldW / 2, 0, 0);
+      g.add(group);
+      words.push({ seqIndex: s, group, letters, opacity: OP_UPCOMING });
+      cursor += worldW + m.gap;
+      s++;
+    }
+    packSeq = s;
+    packIdx = idx + 1;
+    lines.push({ index: idx, group: g, words, start, end: s });
+  }
+
+  function ensureLines(throughIdx: number): void {
+    while (packIdx <= throughIdx) {
+      if (settings.mode === 'words' && packSeq >= seq.length) break;
+      createLine(packIdx);
+    }
+  }
+
+  function lineIndexOf(seqIdx: number): number {
+    for (const l of lines) if (seqIdx >= l.start && seqIdx < l.end) return l.index;
+    while (packSeq <= seqIdx && (settings.mode !== 'words' || packSeq < seq.length)) createLine(packIdx);
+    for (const l of lines) if (seqIdx >= l.start && seqIdx < l.end) return l.index;
+    return lines.length ? lines[lines.length - 1].index : 0;
+  }
+
+  // Keep the plane populated: pack down to the nearest visible line (below the
+  // active one) and a lookahead past the active word, so fast typing never runs
+  // off the packed edge.
+  function ensureLinesForScroll(): void {
+    const nearest = Math.ceil(scroll - CRAWL_ENTER_LINEH) + 1;
+    const activeLi = lineIndexOf(wordIndex);
+    ensureLines(Math.max(nearest, activeLi + CRAWL_VISIBLE_AHEAD));
+  }
+
+  function paint(): void {
+    for (const l of lines) {
+      for (const w of l.words) {
+        if (w.seqIndex < wordIndex) {
+          w.opacity = OP_COMPLETED;
+          for (const ll of w.letters) {
+            if (ll.state === 'incorrect' || ll.state === 'skipped') setPastError(ll);
+            else setCompleted(ll);
+          }
+        } else if (w.seqIndex > wordIndex) {
+          w.opacity = OP_UPCOMING;
+          for (const ll of w.letters) setUpcoming(ll);
+        } else {
+          w.opacity = OP_CURRENT;
+          for (let i = 0; i < w.letters.length; i++) {
+            const ll = w.letters[i];
+            if (i < letterIdx) letterStates[i] === 'correct' ? setCorrect(ll) : setIncorrect(ll);
+            else setCurrentUntyped(ll);
+          }
+        }
+      }
+    }
+  }
+
+  ensureLinesForScroll();
+  paint();
+
+  // Plane-local Y of the line currently holding the active word, in line-heights
+  // — the miss loop watches this cross CRAWL_MISS_LINEH.
+  function activeLineLineH(): number | null {
+    if (!seq[wordIndex]) return null;
+    const li = lineIndexOf(wordIndex);
+    return scroll - li;
+  }
+
+  return {
+    camBase: CRAWL_CAM_BASE,
+    camLook: CRAWL_CAM_LOOK,
+    camFov: CRAWL_FOV,
+    lockCamera: true,
+    tiltX: -CRAWL_TILT,
+    currentWord() {
+      for (const l of lines)
+        for (const w of l.words) if (w.seqIndex === wordIndex) return { group: w.group, letters: w.letters };
+      return null;
+    },
+    paint,
+    advance() {
+      ensureLinesForScroll();
+      paint();
+    },
+    retreat() {
+      paint();
+    },
+    boundaryGap() {
+      return m.gap;
+    },
+    interLetterGap() {
+      return 0;
+    },
+    caretDims() {
+      return { w: Math.max(0.03, m.em * 0.05), h: m.em * 1.05 };
+    },
+    update(dt: number) {
+      if (state.phase === 'running') scroll += currentSpeed * dt;
+      ensureLinesForScroll();
+
+      // Auto-miss every active word whose line has climbed past the miss line.
+      // A whole line crosses at once, so this may retire several words in a frame
+      // (the remaining untyped words on that line) — the identity dissolve moment.
+      let guard = 0;
+      while (state.phase === 'running') {
+        const ly = activeLineLineH();
+        if (ly === null || ly < CRAWL_MISS_LINEH) break;
+        missActiveWord();
+        if (++guard > 400) break;
+      }
+
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const l = lines[i];
+        const y = rowY(l.index);
+        l.group.position.y = y;
+        const fade = fadeFor(y);
+        for (const w of l.words) for (const ll of w.letters) ll.setOpacity(w.opacity * fade);
+        if (y > horizonWorldY) {
+          for (const w of l.words) disposeWord(w.group, w.letters);
+          l.group.removeFromParent();
+          lines.splice(i, 1);
+        }
+      }
+
+      // Restrained starfield parallax — a slow rotational drift, nothing showy.
+      stars.rotation.y += dt * 0.006;
+      stars.position.x = Math.sin(animClock * 0.05) * 1.5;
+    },
+    relayout() {
+      /* crawl sizing is world-based (viewport-independent) — nothing to redo */
+    },
+    dispose() {
+      for (const l of lines) {
+        for (const w of l.words) disposeWord(w.group, w.letters);
+        l.group.removeFromParent();
+      }
+      lines = [];
+      root.removeFromParent();
+      stars.removeFromParent();
+      stars.geometry.dispose();
+      (stars.material as THREE.Material).dispose();
+    },
+    info() {
+      root.updateWorldMatrix(true, false);
+      const missY = root.localToWorld(new THREE.Vector3(0, missWorldY, 0)).y;
+      const active = lines.find((l) => wordIndex >= l.start && wordIndex < l.end);
+      return {
+        view: 'crawl',
+        lineProgress: +scroll.toFixed(3),
+        missLineY: +missY.toFixed(3),
+        currentSpeed: +currentSpeed.toFixed(4),
+        missed: state.missed,
+        lines: lines.length,
+        activeWords: active ? active.words.map((w) => w.seqIndex) : [],
+        rows: lines
+          .slice()
+          .sort((a, b) => a.index - b.index)
+          .map((l) => ({ index: l.index, y: +l.group.position.y.toFixed(3), words: l.words.map((w) => w.seqIndex) })),
+      };
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Game state + stats
 // ---------------------------------------------------------------------------
 type Phase = 'ready' | 'running' | 'finished';
@@ -913,6 +1241,7 @@ const state = {
   correct: 0,
   incorrect: 0,
   wordsDone: 0,
+  missed: 0, // crawl: words that crossed the miss line with letters still untyped
   elapsed: 0, // seconds accumulated while running — frame-driven so the debug
   // handle can run deterministically (see update()).
 };
@@ -931,6 +1260,9 @@ const HIST_PREFIX = 'typefall.hist.v1:';
 
 function configKey(): string {
   const amount = settings.mode === 'time' ? settings.time : settings.mode === 'words' ? settings.words : 0;
+  // Crawl chases its own best per speed setting — a 1.6x run and an auto run are
+  // different challenges, so each keeps a separate highscore.
+  if (settings.view === 'crawl') return `${settings.mode}:${amount}:crawl:${settings.speed}`;
   return `${settings.mode}:${amount}:${settings.view}`;
 }
 function loadPb(key: string): ScoreRecord | null {
@@ -1049,6 +1381,7 @@ function handleChar(ch: string) {
     setCorrect(pending);
     letterStates[letterIdx] = 'correct';
     state.correct++;
+    wpmSamples.push(animClock); // feed the crawl auto-speed rolling window
     letterIdx++;
     if (letterIdx >= w.letters.length && allCurrentCorrect()) completeWord();
     else activeView.paint();
@@ -1129,7 +1462,14 @@ function handleSpace() {
 }
 
 function completeWord() {
-  state.correct++; // implicit space, keeps WPM honest
+  advanceWord(true); // implicit space credited — keeps WPM honest
+}
+
+// Shared word-boundary advance. `creditSpace` adds the implicit-space correct
+// keystroke a real finish earns; an auto-missed word passes false (the player
+// never pressed space, so crediting it would flatter their WPM).
+function advanceWord(creditSpace: boolean) {
+  if (creditSpace) state.correct++;
   state.wordsDone++;
   wordHistory[wordIndex] = letterStates.slice(); // remember for backspace-into-previous
   letterStates = [];
@@ -1140,6 +1480,88 @@ function completeWord() {
   wordIndex++;
   letterIdx = 0;
   activeView.advance();
+}
+
+// Crawl: the active word's line has crossed the miss line. Mark the untyped
+// remainder as skipped errors (each costs a keystroke, exactly like a space-skip),
+// count the word as missed, fire a low-intensity dissolve on each lost letter,
+// then advance the passage. Called in a loop so a whole line's worth of unfinished
+// words retire together as the line crosses.
+function missActiveWord() {
+  const w = activeView.currentWord();
+  if (!w) return;
+  const hadUntyped = letterIdx < w.letters.length;
+  for (let i = letterIdx; i < w.letters.length; i++) {
+    const l = w.letters[i];
+    l.state = 'skipped';
+    letterStates[i] = 'skipped';
+    state.incorrect++;
+    spawnDissolve(l);
+  }
+  letterIdx = w.letters.length;
+  if (hadUntyped) state.missed++;
+  advanceWord(false);
+}
+
+// A subtle disintegrate on a missed glyph — the same effect the passage sheds on
+// correct keys, at low intensity and red, so a missed word visibly crumbles away
+// rather than just recolouring. The original letter stays (it recedes and fades
+// with the climbing line); this is a peeled clone at the glyph's exact transform.
+function spawnDissolve(l: LayoutLetter) {
+  const src = l.object3d;
+  src.updateWorldMatrix(true, false);
+  const wp = new THREE.Vector3();
+  const wq = new THREE.Quaternion();
+  const ws = new THREE.Vector3();
+  src.matrixWorld.decompose(wp, wq, ws);
+  const s = l.cloneScale ?? ws.x;
+  const glyph = getGlyph(l.ch);
+  const mat = new THREE.MeshStandardMaterial({
+    color: RED,
+    roughness: 0.6,
+    metalness: 0.02,
+    emissive: RED,
+    emissiveIntensity: 0.14,
+    transparent: true,
+    opacity: 1,
+  });
+  const clone = new THREE.Mesh(glyph.geo, mat);
+  clone.position.copy(wp);
+  clone.position.z += 0.3;
+  clone.quaternion.copy(wq);
+  clone.scale.setScalar(s);
+  scene.add(clone);
+  const half = new CANNON.Vec3(glyph.half.x * s, glyph.half.y * s, glyph.half.z * s);
+  effects.play('disintegrate', clone, { color: new THREE.Color(RED), half }, 0.4);
+}
+
+// --- crawl speed controller ------------------------------------------------
+// Rolling WPM over a 10s window (frame-clock based, so the automation tab's
+// suspended rAF can't skew it). Correct keystrokes are timestamped in wpmSamples.
+function rollingWpm(): number {
+  const win = 10;
+  const now = animClock;
+  while (wpmSamples.length && now - wpmSamples[0] > win) wpmSamples.shift();
+  const span = Math.min(win, Math.max(0.5, state.elapsed));
+  return wpmSamples.length / 5 / (span / 60);
+}
+
+// Set the crawl climb rate for this frame. Fixed speeds are just the base rate
+// times the multiplier. 'auto' is a gentle proportional controller: it aims the
+// line rate at the player's pace (rolling WPM → words/s → lines/s), kept a touch
+// behind so the miss line chases just below true pace, then eases toward that aim
+// with a time-constant so the crawl never jerks. Clamped so it never stalls or
+// bolts.
+function updateCrawlSpeed(dt: number) {
+  if (settings.speed !== 'auto') {
+    currentSpeed = CRAWL_BASE_LPS * (CRAWL_SPEED_FACTORS[settings.speed] ?? 1);
+    return;
+  }
+  const wpm = rollingWpm();
+  const linesPerSec = wpm / 5 / 60 / CRAWL_AVG_WPL; // words/min → words/s → lines/s
+  const target = THREE.MathUtils.clamp(linesPerSec * CRAWL_AUTO_CHASE, CRAWL_AUTO_MIN, CRAWL_AUTO_MAX);
+  currentSpeed += (target - currentSpeed) * (1 - Math.exp(-dt / CRAWL_AUTO_TAU));
+  currentSpeed = THREE.MathUtils.clamp(currentSpeed, CRAWL_AUTO_MIN, CRAWL_AUTO_MAX);
 }
 
 function addShake(mag: number) {
@@ -1157,7 +1579,12 @@ function newSequence() {
 
 function buildView() {
   if (activeView) activeView.dispose();
-  activeView = settings.view === 'stream' ? makeStreamView() : makeParagraphView();
+  activeView =
+    settings.view === 'stream'
+      ? makeStreamView()
+      : settings.view === 'crawl'
+        ? makeCrawlView()
+        : makeParagraphView();
   caretSnap = true; // don't fly the caret in from its old position on rebuild
   camBase.copy(activeView.camBase);
   camLook.copy(activeView.camLook);
@@ -1171,8 +1598,10 @@ function restart() {
   state.correct = 0;
   state.incorrect = 0;
   state.wordsDone = 0;
+  state.missed = 0;
   state.elapsed = 0;
   effects.reset();
+  resultsPanel.hide();
   shake.set(0, 0, 0);
   ui.hideResults();
   ui.closeMenu();
@@ -1182,6 +1611,8 @@ function restart() {
   letterStates = [];
   wordHistory = [];
   caretPulse = 0;
+  wpmSamples = [];
+  currentSpeed = settings.speed === 'auto' ? CRAWL_BASE_LPS : CRAWL_BASE_LPS * (CRAWL_SPEED_FACTORS[settings.speed] ?? 1);
   newSequence();
   buildView();
   updateHud();
@@ -1210,11 +1641,19 @@ function finish() {
     correct: state.correct,
     incorrect: state.incorrect,
     timeSec: elapsedSec(),
+    missed: settings.view === 'crawl' ? state.missed : null,
     pb: prevPb,
     isNewPb,
     deltaPb,
     history: history.map((h) => ({ wpm: h.wpm, acc: h.acc })),
   });
+  // Try the html-in-canvas panel: where drawElement exists it paints the live
+  // overlay onto a floating 3D card and the DOM overlay drops to invisible-but-
+  // interactive; where it doesn't, the DOM overlay is unchanged. Either way the
+  // footer records which path ran. Guarded — any failure falls back silently.
+  const paneled = resultsPanel.tryShow();
+  ui.getResultsElement().classList.toggle('panel-mirrored', paneled);
+  ui.setPanelLabel(resultsPanel.label);
   rainResultLetters(isNewPb);
 }
 
@@ -1263,6 +1702,10 @@ const ui = createUI({
   },
   onFocusRestore: () => regainFocus(),
 });
+
+// The floating html-in-canvas results panel (progressive enhancement). Where the
+// API is absent it stays dormant and the ordinary DOM overlay is shown.
+const resultsPanel = new ResultsPanel(scene, ui.getResultsElement());
 
 // ---------------------------------------------------------------------------
 // Keyboard + mobile input
@@ -1362,6 +1805,9 @@ window.addEventListener('blur', loseFocus);
 window.addEventListener('focus', regainFocus);
 window.addEventListener('pointerdown', () => {
   if (focusLost) regainFocus();
+  // When the results panel is mirrored the DOM overlay is off-screen, so a click
+  // anywhere on the finished screen (the floating 3D panel) restarts.
+  else if (state.phase === 'finished' && resultsPanel.active && !ui.isMenuOpen()) restart();
 });
 
 // ---------------------------------------------------------------------------
@@ -1417,6 +1863,7 @@ function updateCaret(dt: number) {
   const pulse = caretPulse;
   const dims = activeView.caretDims();
   caret.scale.set(dims.w * (1 + 0.9 * pulse), dims.h, 1);
+  caret.rotation.set(activeView.tiltX, 0, 0); // match a tilted reading plane (crawl)
 
   const mat = caret.material as THREE.MeshBasicMaterial;
   let opacity: number;
@@ -1450,9 +1897,15 @@ function update(dt: number) {
   if (state.phase === 'running') state.elapsed += dt;
   animClock += dt;
 
+  // Crawl climb rate (fixed multiplier, or the auto WPM rubber-band) is resolved
+  // before the view scrolls so the miss line always reflects this frame's pace.
+  if (settings.view === 'crawl') updateCrawlSpeed(dt);
+
   activeView.update(dt);
 
   updateCaret(dt);
+
+  if (resultsPanel.active) resultsPanel.drawFrame(camera, dt);
 
   // Camera shake + caret-pulse decay.
   shake.multiplyScalar(Math.pow(0.0025, dt));
@@ -1488,7 +1941,9 @@ function updateHud() {
     modeLabel = 'zen';
     progress = String(state.wordsDone);
   }
-  ui.setHud(modeLabel, progress, `${liveWpm()} wpm`, `${accuracy()}%`, state.phase === 'running');
+  // Crawl keeps the same one-liner but appends a missed counter.
+  const extra = settings.view === 'crawl' ? `${state.missed} missed` : '';
+  ui.setHud(modeLabel, progress, `${liveWpm()} wpm`, `${accuracy()}%`, state.phase === 'running', extra);
 }
 
 function render() {
@@ -1556,6 +2011,12 @@ function snapshot() {
     resultsShown: state.phase === 'finished',
     focusLost,
     layout: activeView ? activeView.info() : {},
+    // Crawl state, surfaced flat for deterministic tests (also in layout).
+    missed: state.missed,
+    currentSpeed: +currentSpeed.toFixed(4),
+    lineProgress: settings.view === 'crawl' ? ((activeView?.info().lineProgress as number) ?? 0) : 0,
+    missLineY: settings.view === 'crawl' ? ((activeView?.info().missLineY as number) ?? 0) : 0,
+    panel: { supported: resultsPanel.support.supported, drawMethod: resultsPanel.support.drawMethod, label: resultsPanel.label },
     configKey: configKey(),
     pb: loadPb(configKey())?.wpm ?? null,
     lastResult,
@@ -1627,6 +2088,24 @@ function snapshot() {
     for (let i = 0; i < n; i++) update(1 / 60);
     render();
     return effects.fallCount;
+  },
+  // Mock-verify the drawElement panel path without needing the real API: run the
+  // paint seam against a recording stub ctx and return the calls it received. The
+  // production path calls the very same seam, so this proves its call shape.
+  panelDrawProbe(method: 'drawElement' | 'drawElementImage' = 'drawElement') {
+    const calls: { fn: string; args: unknown[] }[] = [];
+    const stub = new Proxy(
+      {},
+      {
+        get: (_t, prop: string) => (...args: unknown[]) => calls.push({ fn: prop, args }),
+      },
+    );
+    const el = ui.getResultsElement();
+    paintElementToCtx(stub, method, el, 800, 600);
+    return { calls, drewElement: calls.some((c) => c.fn === method && c.args[0] === el) };
+  },
+  panelSupport() {
+    return detectHtmlInCanvas();
   },
 };
 

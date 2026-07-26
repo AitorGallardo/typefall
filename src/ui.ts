@@ -3,12 +3,15 @@ import {
   type ModeId,
   type ViewId,
   type EffectId,
+  type SpeedId,
   TIME_OPTIONS,
   WORD_OPTIONS,
   VIEW_OPTIONS,
   VIEW_LABELS,
   EFFECT_OPTIONS,
   EFFECT_LABELS,
+  SPEED_OPTIONS,
+  SPEED_LABELS,
 } from './settings';
 
 export interface ResultStats {
@@ -18,6 +21,7 @@ export interface ResultStats {
   correct: number;
   incorrect: number;
   timeSec: number;
+  missed: number | null; // crawl: words that crossed the miss line untyped (null = hide)
   pb: number | null; // previous best wpm for this config (null = none yet)
   isNewPb: boolean;
   deltaPb: number | null; // wpm - previous best, when beaten and a prior best existed
@@ -51,7 +55,10 @@ export function createUI(cb: UICallbacks) {
   const sep2 = el('span', 'hud-sep');
   sep2.textContent = '·';
   const hudAcc = el('span', 'hud-metric');
-  hud.append(hudMode, hudProgress, sep1, hudWpm, sep2, hudAcc);
+  const sep3 = el('span', 'hud-sep');
+  sep3.textContent = '·';
+  const hudExtra = el('span', 'hud-metric'); // crawl: missed counter
+  hud.append(hudMode, hudProgress, sep1, hudWpm, sep2, hudAcc, sep3, hudExtra);
 
   const gear = el('button', 'gear');
   gear.textContent = '⚙';
@@ -77,7 +84,9 @@ export function createUI(cb: UICallbacks) {
   const rHistory = el('div', 'r-history');
   const rHint = el('div', 'r-hint');
   rHint.innerHTML = 'restart <span class="k">tab</span> + <span class="k">enter</span> · or click';
-  results.append(rWpm, rWpmLabel, rPb, rGrid, rHistory, rHint);
+  // Small mono footer, results only: which render path the panel used.
+  const rFooter = el('div', 'r-footer');
+  results.append(rWpm, rWpmLabel, rPb, rGrid, rHistory, rHint, rFooter);
   results.addEventListener('click', () => cb.restart());
 
   // --- settings / menu panel -------------------------------------------
@@ -111,6 +120,14 @@ export function createUI(cb: UICallbacks) {
       opt(VIEW_LABELS[v], s.view === v ? 'sel' : '', () => cb.applySettings({ view: v })),
     );
     panel.appendChild(wrapRow('view', viewBtns));
+
+    // speed (crawl only — the climb rate / auto rubber-band)
+    if (s.view === 'crawl') {
+      const speedBtns = SPEED_OPTIONS.map((sp: SpeedId) =>
+        opt(SPEED_LABELS[sp], s.speed === sp ? 'sel' : '', () => cb.applySettings({ speed: sp })),
+      );
+      panel.appendChild(wrapRow('speed', speedBtns));
+    }
 
     // mode
     const modeBtns = (['time', 'words', 'zen'] as ModeId[]).map((m) =>
@@ -226,11 +243,17 @@ export function createUI(cb: UICallbacks) {
   }
 
   return {
-    setHud(modeLabel: string, progress: string, wpm: string, acc: string, active: boolean) {
+    getResultsElement: () => results,
+    setPanelLabel(label: string) {
+      rFooter.textContent = `panel: ${label}`;
+    },
+    setHud(modeLabel: string, progress: string, wpm: string, acc: string, active: boolean, extra = '') {
       hudMode.textContent = modeLabel;
       hudProgress.textContent = progress;
       hudWpm.textContent = wpm;
       hudAcc.textContent = acc;
+      hudExtra.textContent = extra;
+      sep3.style.display = extra ? '' : 'none';
       hud.classList.toggle('active', active);
     },
     setHudVisible(v: boolean) {
@@ -263,6 +286,7 @@ export function createUI(cb: UICallbacks) {
         ['chars', `${st.correct}/${st.incorrect}`],
         ['time', `${st.timeSec.toFixed(1)}s`],
       ];
+      if (st.missed != null) cells.push(['missed', String(st.missed)]);
       for (const [k, v] of cells) {
         const cell = el('div', 'r-cell');
         const kk = el('div', 'r-k');

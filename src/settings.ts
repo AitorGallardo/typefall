@@ -2,7 +2,11 @@
 // a mode, an amount for that mode, a completion effect, and an optional sound.
 
 export type ModeId = 'time' | 'words' | 'zen';
-export type ViewId = 'paragraph' | 'stream';
+export type ViewId = 'crawl' | 'paragraph' | 'stream';
+// Crawl-only line speed. The numeric options are multipliers on the base
+// climb rate; 'auto' rubber-bands the crawl to the player's rolling WPM so the
+// miss line always chases just behind their true pace — a race against yourself.
+export type SpeedId = '0.8' | '1' | '1.25' | '1.6' | 'auto';
 export type EffectId =
   | 'fall'
   | 'explode'
@@ -18,18 +22,33 @@ export interface Settings {
   time: number; // seconds, time mode
   words: number; // count, words mode
   effect: EffectId;
+  speed: SpeedId; // crawl-only line speed
   sound: boolean;
 }
 
 export const TIME_OPTIONS = [15, 30, 60];
 export const WORD_OPTIONS = [10, 25, 50];
 
-// paragraph → monkeytype-style readable wall of rows; stream → words fly in
-// from the background. paragraph is the default.
-export const VIEW_OPTIONS: ViewId[] = ['paragraph', 'stream'];
+// crawl → a Star Wars opening crawl: the reading surface tilts back and the
+// lines climb continuously toward a horizon fade, typed as they travel;
+// paragraph → a calm monkeytype-style wall of rows; stream → words fly in from
+// the background. crawl is the default.
+export const VIEW_OPTIONS: ViewId[] = ['crawl', 'paragraph', 'stream'];
 export const VIEW_LABELS: Record<ViewId, string> = {
+  crawl: 'crawl',
   paragraph: 'paragraph',
   stream: 'stream',
+};
+
+// Crawl speed picker. Numeric values are climb-rate multipliers; 'auto' hands
+// control to the WPM rubber-band controller.
+export const SPEED_OPTIONS: SpeedId[] = ['0.8', '1', '1.25', '1.6', 'auto'];
+export const SPEED_LABELS: Record<SpeedId, string> = {
+  '0.8': '0.8x',
+  '1': '1x',
+  '1.25': '1.25x',
+  '1.6': '1.6x',
+  auto: 'auto',
 };
 
 // The concrete effects plus the rotating "surprise". Order drives the picker
@@ -57,11 +76,12 @@ export const EFFECT_LABELS: Record<EffectId, string> = {
 const KEY = 'typefall.settings.v1';
 
 const DEFAULTS: Settings = {
-  view: 'paragraph',
+  view: 'crawl',
   mode: 'words',
   time: 30,
   words: 25,
   effect: 'fall',
+  speed: '1',
   sound: false,
 };
 
@@ -77,6 +97,7 @@ export function loadSettings(): Settings {
     if (!TIME_OPTIONS.includes(s.time)) s.time = DEFAULTS.time;
     if (!WORD_OPTIONS.includes(s.words)) s.words = DEFAULTS.words;
     if (!EFFECT_OPTIONS.includes(s.effect)) s.effect = DEFAULTS.effect;
+    if (!SPEED_OPTIONS.includes(s.speed)) s.speed = DEFAULTS.speed;
     s.sound = !!s.sound;
     return s;
   } catch {

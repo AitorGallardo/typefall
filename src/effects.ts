@@ -130,15 +130,17 @@ export class EffectSystem {
     return pick as Exclude<EffectId, 'surprise'>;
   }
 
-  play(effect: EffectId, mesh: THREE.Mesh, opts: PlayOpts): void {
+  // `intensity` scales the particle/shard count (1 = full). The crawl view fires
+  // disintegrate at a low intensity for the subtle missed-word dissolve.
+  play(effect: EffectId, mesh: THREE.Mesh, opts: PlayOpts, intensity = 1): void {
     const kind = this.resolve(effect);
     switch (kind) {
       case 'fall':
         return this.doFall(mesh, opts);
       case 'explode':
-        return this.doExplode(mesh, opts);
+        return this.doExplode(mesh, opts, intensity);
       case 'disintegrate':
-        return this.doDisintegrate(mesh, opts);
+        return this.doDisintegrate(mesh, opts, intensity);
       case 'vortex':
         return this.doVortex(mesh);
       case 'launch':
@@ -182,9 +184,9 @@ export class EffectSystem {
     this.capFall();
   }
 
-  private doExplode(mesh: THREE.Mesh, opts: PlayOpts): void {
+  private doExplode(mesh: THREE.Mesh, opts: PlayOpts, intensity = 1): void {
     const p = mesh.position;
-    const n = this.mobile ? 22 : 44;
+    const n = Math.max(4, Math.round((this.mobile ? 22 : 44) * intensity));
     for (let i = 0; i < n; i++) {
       const dir = randDir();
       const speed = 4 + Math.random() * 7;
@@ -194,10 +196,10 @@ export class EffectSystem {
     this.removeMesh(mesh);
   }
 
-  private doDisintegrate(mesh: THREE.Mesh, opts: PlayOpts): void {
+  private doDisintegrate(mesh: THREE.Mesh, opts: PlayOpts, intensity = 1): void {
     const p = mesh.position;
     const half = opts.half;
-    const n = this.mobile ? 26 : 52;
+    const n = Math.max(4, Math.round((this.mobile ? 26 : 52) * intensity));
     for (let i = 0; i < n; i++) {
       // Sample from the letter's bounding volume so it reads as the glyph
       // crumbling in place.
