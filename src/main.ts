@@ -2,6 +2,7 @@ import './style.css';
 import * as THREE from 'three';
 import { FontLoader, type Font } from 'three/addons/loaders/FontLoader.js';
 import { TextGeometry } from 'three/addons/geometries/TextGeometry.js';
+import { Text as TroikaText, preloadFont } from 'troika-three-text';
 import * as CANNON from 'cannon-es';
 import { buildSequence } from './words';
 import { loadSettings, saveSettings, type Settings, type EffectId } from './settings';
@@ -11,15 +12,18 @@ import { createUI } from './ui';
 // ---------------------------------------------------------------------------
 // A monkeytype-style typing test rendered inside a 3D scene. Two presentations
 // share the same scoring, effects and input:
-//   • paragraph (default) — a measured-flow layout engine places words by their
-//     glyph widths into a centered column and shows three lines at once; the
-//     active word is bright with a thin green caret, upcoming words are muted,
-//     typed letters turn green, mistakes red, and finished lines scroll up.
-//   • stream — upcoming words fly in from the background; the current word sits
-//     up front and the next few recede and dim.
-// Each correct keystroke locks the letter in place (green) and blows away a
-// clone with the selected effect, so the passage never reflows. A wrong key
-// turns the letter red and advances the caret; backspace restores letters in
+//   • paragraph (default) — the reading surface is flat SDF text (troika-three-
+//     text, JetBrains Mono): crisp, calm, tool-like. A measured-flow layout
+//     engine places words by their real monospace glyph advances into a centered
+//     column and shows three lines at once; the active word is bright with a thin
+//     green caret that smoothly lerps + blinks, upcoming words are muted, typed
+//     letters turn green, mistakes red, and finished lines scroll up.
+//   • stream — upcoming words fly in from the background as chunky extruded 3D
+//     letters; the current word sits up front and the next few recede and dim.
+// Each correct keystroke locks the flat letter in place (green) and detaches a
+// chunky extruded 3D clone that blows away with the selected effect — that's
+// where Typefall's identity lives now — so the passage never reflows. A wrong
+// key turns the letter red and advances the caret; backspace restores letters in
 // the current word, which won't complete until every character is correct.
 // ---------------------------------------------------------------------------
 
@@ -74,6 +78,15 @@ const PARA_VISIBLE = 3; // rows shown at once (active + the next two)
 const PARA_CENTER_BIAS = 0.05; // push the block this fraction of view height above center
 // (kept slight — the owner spec asks for "near visual center, slightly above if
 // necessary"; 0.05 keeps the block centered with fall room, not in the upper third)
+
+// The flat reading surface uses a real monospace typeface bundled locally (no
+// runtime CDN fetch) and rendered as SDF text by troika. Monospace means every
+// glyph shares one advance, so the measured-flow packing is perfectly regular.
+const PARA_FONT_URL = `${import.meta.env.BASE_URL}fonts/JetBrainsMono-Regular.ttf`;
+// Advance width of one glyph as a fraction of the em, measured from the real
+// font at boot (see measureMonoAdvance). 0.6 is JetBrains Mono's true advance
+// and a safe fallback if the measurement font hasn't resolved yet.
+let MONO_ADVANCE = 0.6;
 
 // --- per-view cameras (fov chosen per view; paragraph is flat/near-orthographic
 // so rows stay parallel and letters keep a uniform size — the "tool" feel) ---
@@ -234,53 +247,62 @@ function getGlyph(ch: string): Glyph {
   return g;
 }
 
-// Unscaled width of a word (glyph units) — measured from the cache, no meshes.
-// Memoized per word: the paragraph re-packer calls this for every word on every
-// relayout, so caching keeps relayout independent of how many distinct words
-// have been measured.
-const wordWidthCache = new Map<string, number>();
-function wordUnscaledWidth(text: string): number {
-  const cached = wordWidthCache.get(text);
-  if (cached !== undefined) return cached;
-  let w = 0;
-  for (const ch of text) w += getGlyph(ch).width;
-  w += LETTER_SPACING * (text.length - 1);
-  wordWidthCache.set(text, w);
-  return w;
-}
-
 // ---------------------------------------------------------------------------
 // Caret
 // ---------------------------------------------------------------------------
-// A thin green vertical bar. Its world position and scale are recomputed each
-// frame from the active word's glyph advances so it lands exactly on the next
-// character boundary and never overlaps a letter (see updateCaret).
+// A thin green vertical bar (unit box, scaled per-frame to the active word's
+// glyph size). It smoothly lerps to the next character boundary on every
+// keystroke and blinks at rest — monkeytype's smooth caret (see updateCaret).
 const caret = new THREE.Mesh(
-  new THREE.BoxGeometry(0.06, LETTER_SIZE * 1.05, 0.03),
+  new THREE.BoxGeometry(1, 1, 0.04),
   new THREE.MeshBasicMaterial({ color: GREEN, transparent: true, opacity: 0.9 }),
 );
 caret.visible = false;
+caret.renderOrder = 10;
 scene.add(caret);
+const caretTarget = new THREE.Vector3();
+const CARET_TAU = 0.045; // position-lerp time constant → ~100ms fast ease-out
+const CARET_BLINK_PERIOD = 1.0; // seconds per blink cycle
+const CARET_TYPE_PAUSE = 1.0; // seconds the caret stays solid after a keystroke
+let caretSnap = true; // snap (don't lerp) on first show / view switch
+// Frame-driven clocks (the automation tab suspends rAF, so wall-clock time can't
+// drive the caret) — animClock advances by dt each frame, lastTypeClock records
+// the last keystroke so the caret pauses blinking while typing.
+let animClock = 0;
+let lastTypeClock = -10;
+function noteType() {
+  lastTypeClock = animClock;
+}
 
 // ---------------------------------------------------------------------------
 // Shared word / letter primitives
 // ---------------------------------------------------------------------------
 type LetterState = 'untyped' | 'correct' | 'incorrect' | 'skipped';
 
+// A single laid-out letter, backed by either an extruded 3D mesh (stream view)
+// or a flat troika SDF glyph (paragraph reading surface). The shared scoring /
+// caret / clone pipeline talks to letters only through this interface, so the
+// two rendering backends stay swappable.
 interface LayoutLetter {
   ch: string;
-  mesh: THREE.Mesh;
-  mat: THREE.MeshStandardMaterial;
-  localX: number; // x within the word group (unscaled glyph units)
-  halfWidth: number; // unscaled half advance
+  object3d: THREE.Object3D; // world-transform source for the caret + detached clone
+  localX: number; // x of the glyph centre within the word group (local units)
+  halfWidth: number; // half advance (local units)
   state: LetterState;
+  // World scale to give the extruded clone so it matches the on-screen glyph.
+  // undefined → derive from the object's live world scale (stream, where words
+  // fly and scale over time); a number → fixed (paragraph, group scale is 1).
+  cloneScale?: number;
+  // Colour the letter. `emissive` is the self-lit intensity used by the extruded
+  // stream letters; the flat paragraph glyphs are unlit and ignore it (glow lives
+  // on the falling clones only — the reading surface stays calm).
+  applyColor(color: number, emissive: number): void;
+  setOpacity(o: number): void;
+  dispose(): void;
 }
 
-// Build a word group with its letters centred around the group origin. Not
-// added to any parent — the caller scales and places it. The originals stay put
-// for the whole test so their layout slots are reserved (no reflow) and typed
-// letters can be un-typed by backspace; the flying "blow away" effect operates
-// on a clone (see detachClone).
+// Build an extruded-3D word group (stream view) with its letters centred around
+// the group origin. Not added to any parent — the caller scales and places it.
 function createWord(
   text: string,
   castShadow = true,
@@ -306,8 +328,78 @@ function createWord(
     const localX = cursor + widths[i] / 2;
     mesh.position.set(localX, 0, 0);
     group.add(mesh);
-    letters.push({ ch, mesh, mat, localX, halfWidth: widths[i] / 2, state: 'untyped' });
+    letters.push({
+      ch,
+      object3d: mesh,
+      localX,
+      halfWidth: widths[i] / 2,
+      state: 'untyped',
+      applyColor(color, emissive) {
+        mat.color.setHex(color);
+        mat.emissive.setHex(color);
+        mat.emissiveIntensity = emissive;
+      },
+      setOpacity(o) {
+        mat.opacity = o;
+      },
+      dispose() {
+        group.remove(mesh);
+        mat.dispose();
+      },
+    });
     cursor += widths[i] + LETTER_SPACING;
+  });
+  return { group, letters, width: total };
+}
+
+// Build a flat troika word group (paragraph view): one SDF Text node per glyph,
+// centred on its monospace slot so its transform origin matches the extruded
+// clone's centred geometry. `em` is the glyph world height; `advance` the slot
+// width. Text nodes sync asynchronously and render once ready.
+function createTroikaWord(
+  text: string,
+  em: number,
+  advance: number,
+): { group: THREE.Group; letters: LayoutLetter[]; width: number } {
+  const group = new THREE.Group();
+  const total = advance * text.length;
+  const cloneScale = em / LETTER_SIZE; // extruded glyph is built at size = LETTER_SIZE
+  let cursor = -total / 2;
+  const letters: LayoutLetter[] = [];
+  [...text].forEach((ch) => {
+    const t = new TroikaText();
+    t.text = ch;
+    t.font = PARA_FONT_URL;
+    t.fontSize = em;
+    t.anchorX = 'center';
+    t.anchorY = 'middle';
+    t.color = GRAY;
+    t.fillOpacity = OP_UPCOMING;
+    t.material.transparent = true;
+    t.material.fog = false; // keep the reading surface crisp, never hazed by scene fog
+    const localX = cursor + advance / 2;
+    t.position.set(localX, 0, 0);
+    t.sync();
+    group.add(t);
+    letters.push({
+      ch,
+      object3d: t,
+      localX,
+      halfWidth: advance / 2,
+      state: 'untyped',
+      cloneScale,
+      applyColor(color) {
+        t.color = color;
+      },
+      setOpacity(o) {
+        t.fillOpacity = o;
+      },
+      dispose() {
+        group.remove(t);
+        t.dispose();
+      },
+    });
+    cursor += advance;
   });
   return { group, letters, width: total };
 }
@@ -315,48 +407,33 @@ function createWord(
 // Dispose a word group and every letter it owns. Flying clones are owned by the
 // effect system (which disposes them when the effect ends) — never touched here.
 function disposeWord(group: THREE.Group, letters: LayoutLetter[]) {
-  for (const l of letters) {
-    group.remove(l.mesh);
-    l.mat.dispose();
-  }
+  for (const l of letters) l.dispose();
   group.removeFromParent();
 }
 
-// --- per-state colouring (colour + emissive only; opacity is a view concern) ---
+// --- per-state colouring (colour + emissive tier; opacity is a view concern) ---
 function setUpcoming(l: LayoutLetter) {
-  l.mat.color.setHex(GRAY);
-  l.mat.emissive.setHex(GRAY);
-  l.mat.emissiveIntensity = EM_UPCOMING;
+  l.applyColor(GRAY, EM_UPCOMING);
 }
 function setCurrentUntyped(l: LayoutLetter) {
-  l.mat.color.setHex(WHITE);
-  l.mat.emissive.setHex(WHITE);
-  l.mat.emissiveIntensity = EM_CURRENT;
+  l.applyColor(WHITE, EM_CURRENT);
 }
 function setCorrect(l: LayoutLetter) {
-  l.mat.color.setHex(GREEN);
-  l.mat.emissive.setHex(GREEN);
-  l.mat.emissiveIntensity = EM_CORRECT;
+  l.applyColor(GREEN, EM_CORRECT);
 }
 function setIncorrect(l: LayoutLetter) {
-  l.mat.color.setHex(RED);
-  l.mat.emissive.setHex(RED);
-  l.mat.emissiveIntensity = EM_INCORRECT;
+  l.applyColor(RED, EM_INCORRECT);
 }
 // Completed word, letter typed correctly — sinks to a neutral dim gray (the
 // monkeytype past-text look), not green. Only the active word's correct prefix
 // stays green; finished text recedes so the eye tracks the live word.
 function setCompleted(l: LayoutLetter) {
-  l.mat.color.setHex(PAST);
-  l.mat.emissive.setHex(PAST);
-  l.mat.emissiveIntensity = EM_COMPLETED;
+  l.applyColor(PAST, EM_COMPLETED);
 }
 // Completed word, letter that was wrong or skipped — a dimmed red tint so past
 // mistakes stay visible without shouting over the live word.
 function setPastError(l: LayoutLetter) {
-  l.mat.color.setHex(PAST_RED);
-  l.mat.emissive.setHex(PAST_RED);
-  l.mat.emissiveIntensity = EM_COMPLETED + 0.04;
+  l.applyColor(PAST_RED, EM_COMPLETED + 0.04);
 }
 
 // Spawn a flying clone of a just-typed letter at its exact on-screen transform
@@ -364,12 +441,16 @@ function setPastError(l: LayoutLetter) {
 // turns green and holds its layout slot), so the passage never reflows and
 // backspace can restore the letter to an untyped state.
 function detachClone(l: LayoutLetter, effect: EffectId) {
-  const src = l.mesh;
+  const src = l.object3d;
   src.updateWorldMatrix(true, false);
   const wp = new THREE.Vector3();
   const wq = new THREE.Quaternion();
   const ws = new THREE.Vector3();
   src.matrixWorld.decompose(wp, wq, ws);
+  // A flat troika glyph has world scale 1, so its own scale can't size the
+  // extruded clone — use the letter's fixed cloneScale. Extruded stream letters
+  // have no cloneScale and inherit their live world scale.
+  const s = l.cloneScale ?? ws.x;
   const glyph = getGlyph(l.ch);
   const mat = new THREE.MeshStandardMaterial({
     color: WHITE,
@@ -385,9 +466,9 @@ function detachClone(l: LayoutLetter, effect: EffectId) {
   clone.position.copy(wp);
   clone.position.z += 0.5; // peel toward the camera so it never falls through lines below
   clone.quaternion.copy(wq);
-  clone.scale.copy(ws);
+  clone.scale.setScalar(s);
   scene.add(clone);
-  const half = new CANNON.Vec3(glyph.half.x * ws.x, glyph.half.y * ws.y, glyph.half.z * ws.z);
+  const half = new CANNON.Vec3(glyph.half.x * s, glyph.half.y * s, glyph.half.z * s);
   effects.play(effect, clone, { color: new THREE.Color(WHITE), half });
 }
 
@@ -401,6 +482,8 @@ interface View {
   advance(): void; // move to the next word (scroll / slide)
   retreat(): void; // step back to the previous word (backspace across a boundary)
   boundaryGap(): number; // unscaled gap past the last glyph, for the word-end caret
+  interLetterGap(): number; // unscaled gap between glyphs, for the inter-letter caret
+  caretDims(): { w: number; h: number }; // caret bar world size for the active word
   update(dt: number): void; // per-frame layout easing
   relayout(): void; // recompute layout for a new viewport (keeps progress)
   dispose(): void;
@@ -519,6 +602,14 @@ function makeStreamView(): View {
     boundaryGap() {
       return LETTER_SPACING;
     },
+    interLetterGap() {
+      return LETTER_SPACING;
+    },
+    caretDims() {
+      // The active word rests at slot 0 (scale 1), so the extruded glyphs are
+      // LETTER_SIZE tall; a chunky-ish bar reads well against them.
+      return { w: 0.09, h: LETTER_SIZE * 1.04 };
+    },
     update(dt: number) {
       const lerp = 1 - Math.pow(0.0015, dt);
       for (const w of visible) {
@@ -527,7 +618,7 @@ function makeStreamView(): View {
         const ts = slotScale(w.targetSlot);
         w.group.scale.setScalar(THREE.MathUtils.lerp(w.group.scale.x, ts, lerp));
         const op = slotOpacity(w.targetSlot);
-        for (const l of w.letters) l.mat.opacity = op;
+        for (const l of w.letters) l.setOpacity(op);
       }
     },
     relayout() {
@@ -554,11 +645,13 @@ function makeStreamView(): View {
 // keystroke (only on a viewport resize).
 // ---------------------------------------------------------------------------
 interface ParaMetrics {
-  scale: number; // word-group scale (glyph units → world)
+  em: number; // glyph world height (troika fontSize); word groups are unscaled
+  advance: number; // monospace glyph advance, world units
   colHalf: number; // half the reading-column width, world units
   gap: number; // inter-word gap, world units
   lineH: number; // line height, world units
   topY: number; // world y of the top (active) visible line
+  caretW: number; // caret bar width, world units (~2 CSS px)
 }
 
 function paraMetrics(): ParaMetrics {
@@ -570,7 +663,7 @@ function paraMetrics(): ParaMetrics {
   const visW = visH * aspect;
   const worldPerPx = visW / window.innerWidth;
   const em = PARA_FONT_PX * worldPerPx;
-  const scale = em / LETTER_SIZE; // glyphs are built at size = LETTER_SIZE = 1em
+  const advance = em * MONO_ADVANCE; // real monospace advance from the font metrics
   const colWidth = Math.min(PARA_COL_VW * visW, PARA_COL_MAX_PX * worldPerPx);
   const lineH = PARA_LINE_EM * em;
   // Center the visible block (its middle row) slightly above the frustum's
@@ -578,7 +671,15 @@ function paraMetrics(): ParaMetrics {
   // middle row, so the term generalizes with PARA_VISIBLE instead of assuming 3.
   const centerY = PARA_CAM_LOOK.y;
   const topY = centerY + PARA_CENTER_BIAS * visH + (lineH * (PARA_VISIBLE - 1)) / 2;
-  return { scale, colHalf: colWidth / 2, gap: PARA_GAP_EM * em, lineH, topY };
+  return {
+    em,
+    advance,
+    colHalf: colWidth / 2,
+    gap: PARA_GAP_EM * em,
+    lineH,
+    topY,
+    caretW: Math.max(0.02, 2 * worldPerPx),
+  };
 }
 
 function makeParagraphView(): View {
@@ -620,10 +721,9 @@ function makeParagraphView(): View {
     for (;;) {
       if (settings.mode !== 'words') ensureSeq(s + 1);
       if (s >= seq.length) break;
-      const worldW = wordUnscaledWidth(seq[s]) * m.scale;
+      const worldW = m.advance * seq[s].length; // monospace: advance × char count
       if (words.length > 0 && cursor + worldW > m.colHalf) break;
-      const { group, letters } = createWord(seq[s], false); // paragraph text casts no shadow
-      group.scale.setScalar(m.scale);
+      const { group, letters } = createTroikaWord(seq[s], m.em, m.advance);
       group.position.set(cursor + worldW / 2, 0, 0);
       g.add(group);
       words.push({ seqIndex: s, group, letters, opacity: OP_UPCOMING });
@@ -742,9 +842,15 @@ function makeParagraphView(): View {
       paint();
     },
     boundaryGap() {
-      // The inter-word gap is m.gap in world units; convert to the unscaled glyph
-      // units the caret offset works in (the word group is scaled by m.scale).
-      return m.scale > 0 ? m.gap / m.scale : LETTER_SPACING;
+      // Word groups are unscaled (troika renders at world size), so the world
+      // inter-word gap is the caret's local boundary gap directly.
+      return m.gap;
+    },
+    interLetterGap() {
+      return 0; // monospace advance already bakes in side bearings — no extra gap
+    },
+    caretDims() {
+      return { w: m.caretW, h: m.em * 1.05 };
     },
     update(dt: number) {
       const posLerp = 1 - Math.pow(0.0009, dt);
@@ -757,7 +863,7 @@ function makeParagraphView(): View {
         const fadeTarget = row >= 0 && row < PARA_VISIBLE ? 1 : 0;
         l.fade = THREE.MathUtils.lerp(l.fade, fadeTarget, opLerp);
         for (const w of l.words) {
-          for (const ll of w.letters) ll.mat.opacity = w.opacity * l.fade;
+          for (const ll of w.letters) ll.setOpacity(w.opacity * l.fade);
         }
         // Retire a line once it has scrolled clear above the active line.
         if (row < 0 && l.fade < 0.02) {
@@ -916,6 +1022,7 @@ function handleChar(ch: string) {
   if (state.phase === 'finished') return;
   if (ui.isMenuOpen()) return;
   if (ch === ' ') return; // space is an advance, routed through handleSpace
+  noteType();
 
   const w = activeView.currentWord();
   if (!w) return;
@@ -967,6 +1074,7 @@ function handleChar(ch: string) {
 function handleBackspace() {
   if (state.phase === 'finished') return;
   if (ui.isMenuOpen()) return;
+  noteType();
 
   if (letterIdx === 0) {
     if (wordIndex === 0) return;
@@ -1005,6 +1113,7 @@ function handleBackspace() {
 function handleSpace() {
   if (state.phase === 'finished') return;
   if (ui.isMenuOpen()) return;
+  noteType();
   if (letterIdx === 0) return; // nothing typed yet — no-op
   const w = activeView.currentWord();
   if (!w) return;
@@ -1049,6 +1158,7 @@ function newSequence() {
 function buildView() {
   if (activeView) activeView.dispose();
   activeView = settings.view === 'stream' ? makeStreamView() : makeParagraphView();
+  caretSnap = true; // don't fly the caret in from its old position on rebuild
   camBase.copy(activeView.camBase);
   camLook.copy(activeView.camLook);
   camera.fov = activeView.camFov;
@@ -1151,6 +1261,7 @@ const ui = createUI({
   onMenuClose: () => {
     if (isTouch) capture.focus({ preventScroll: true });
   },
+  onFocusRestore: () => regainFocus(),
 });
 
 // ---------------------------------------------------------------------------
@@ -1228,6 +1339,32 @@ if (isTouch) {
 }
 
 // ---------------------------------------------------------------------------
+// Focus handling — when the window/input loses focus mid-test, dim + blur the
+// passage and show a small mono "click to focus" line; a click anywhere (or the
+// window regaining focus) removes it and re-captures typing. Menu / results are
+// exempt so their own overlays aren't fought.
+// ---------------------------------------------------------------------------
+let focusLost = false;
+function loseFocus() {
+  if (focusLost || ui.isMenuOpen() || state.phase === 'finished') return;
+  focusLost = true;
+  ui.showFocusLost();
+  canvas.classList.add('blurred');
+}
+function regainFocus() {
+  if (!focusLost) return;
+  focusLost = false;
+  ui.hideFocusLost();
+  canvas.classList.remove('blurred');
+  capture.focus({ preventScroll: true });
+}
+window.addEventListener('blur', loseFocus);
+window.addEventListener('focus', regainFocus);
+window.addEventListener('pointerdown', () => {
+  if (focusLost) regainFocus();
+});
+
+// ---------------------------------------------------------------------------
 // Loop
 // ---------------------------------------------------------------------------
 const clock = new THREE.Clock();
@@ -1235,12 +1372,13 @@ let running = true;
 let hudAccum = 0;
 
 // Latest caret placement, surfaced through the debug handle for assertions.
-const caretState = { visible: false, x: 0, y: 0, z: 0 };
+const caretState = { visible: false, x: 0, y: 0, z: 0, targetX: 0, opacity: 0 };
 
-// Place the caret exactly on the next-character boundary, computed from glyph
-// advances (never a fixed slab in front of a letter). It sits in the inter-letter
-// gap just left of the pending glyph, or just past the last glyph at word end.
-function updateCaret(now: number) {
+// Place the caret on the next-character boundary, computed from real glyph
+// advances (never a fixed slab in front of a letter), then smoothly ease it
+// there. It sits just left of the pending glyph, or just past the last glyph at
+// word end, and blinks at rest.
+function updateCaret(dt: number) {
   const cur = activeView.currentWord();
   if (!cur || state.phase === 'finished') {
     caret.visible = false;
@@ -1250,9 +1388,9 @@ function updateCaret(now: number) {
   const pending = cur.letters[letterIdx];
   let localX: number;
   if (pending) {
-    // Between letters the real gap is LETTER_SPACING, so half of it lands the
-    // caret cleanly in the inter-glyph gap just left of the pending letter.
-    localX = pending.localX - pending.halfWidth - LETTER_SPACING * 0.5;
+    // Sit in the boundary just left of the pending glyph. Monospace advances
+    // bake in side bearings (interLetterGap = 0), so this lands on the slot edge.
+    localX = pending.localX - pending.halfWidth - activeView.interLetterGap() * 0.5;
   } else {
     const last = cur.letters[cur.letters.length - 1];
     if (!last) {
@@ -1264,29 +1402,57 @@ function updateCaret(now: number) {
     // the paragraph, a slot gap in the stream), not the intra-word spacing.
     localX = last.localX + last.halfWidth + activeView.boundaryGap() * 0.5;
   }
+  cur.group.localToWorld(caretTarget.set(localX, 0, 0));
+
+  // Snap on first appearance / view switch; otherwise fast ease-out toward the
+  // target — this animates the caret between keystrokes and rides the line scroll.
+  if (!caret.visible || caretSnap) {
+    caret.position.copy(caretTarget);
+    caretSnap = false;
+  } else {
+    caret.position.lerp(caretTarget, 1 - Math.exp(-dt / CARET_TAU));
+  }
   caret.visible = true;
-  cur.group.localToWorld(caret.position.set(localX, 0, 0));
-  // A pulse briefly swells and reddens the caret so overflow input is felt.
+
   const pulse = caretPulse;
-  caret.scale.setScalar(cur.group.scale.x * (1 + 0.6 * pulse));
-  (caret.material as THREE.MeshBasicMaterial).color.setHex(pulse > 0.05 ? RED : GREEN);
-  (caret.material as THREE.MeshBasicMaterial).opacity = Math.min(1, 0.55 + 0.35 * Math.sin(now / 130) + 0.45 * pulse);
+  const dims = activeView.caretDims();
+  caret.scale.set(dims.w * (1 + 0.9 * pulse), dims.h, 1);
+
+  const mat = caret.material as THREE.MeshBasicMaterial;
+  let opacity: number;
+  if (pulse > 0.05) {
+    // Overflow pulse — swell and redden so rejected input is felt.
+    mat.color.setHex(RED);
+    opacity = 1;
+  } else {
+    mat.color.setHex(GREEN);
+    if (animClock - lastTypeClock < CARET_TYPE_PAUSE) {
+      opacity = 1; // solid while typing (and just after), like monkeytype
+    } else {
+      // Calm ~1s sine blink once the typist pauses.
+      const phase = ((animClock - lastTypeClock) % CARET_BLINK_PERIOD) / CARET_BLINK_PERIOD;
+      opacity = 0.12 + 0.88 * (0.5 + 0.5 * Math.cos(phase * Math.PI * 2));
+    }
+  }
+  mat.opacity = opacity;
+
   caretState.visible = true;
   caretState.x = +caret.position.x.toFixed(3);
   caretState.y = +caret.position.y.toFixed(3);
   caretState.z = +caret.position.z.toFixed(3);
+  caretState.targetX = +caretTarget.x.toFixed(3);
+  caretState.opacity = +opacity.toFixed(3);
 }
 
 function update(dt: number) {
   world.step(1 / 60, dt, 3);
 
   if (state.phase === 'running') state.elapsed += dt;
-
-  const now = performance.now();
+  animClock += dt;
 
   activeView.update(dt);
 
-  updateCaret(now);
+  updateCaret(dt);
 
   // Camera shake + caret-pulse decay.
   shake.multiplyScalar(Math.pow(0.0025, dt));
@@ -1388,6 +1554,7 @@ function snapshot() {
     bodies: effects.fallCount,
     menuOpen: ui.isMenuOpen(),
     resultsShown: state.phase === 'finished',
+    focusLost,
     layout: activeView ? activeView.info() : {},
     configKey: configKey(),
     pb: loadPb(configKey())?.wpm ?? null,
@@ -1446,6 +1613,15 @@ function snapshot() {
   },
   render,
   reset: restart,
+  // Focus overlay, driven for automation (the real listeners fire on these).
+  blur() {
+    window.dispatchEvent(new Event('blur'));
+    return snapshot();
+  },
+  refocus() {
+    window.dispatchEvent(new Event('focus'));
+    return snapshot();
+  },
   // Deterministic settle for pixel testing of the fall pile / line scroll.
   settle(n = 90) {
     for (let i = 0; i < n; i++) update(1 / 60);
@@ -1457,8 +1633,43 @@ function snapshot() {
 // ---------------------------------------------------------------------------
 // Boot
 // ---------------------------------------------------------------------------
+// Measure the real monospace advance (as a fraction of the em) from the bundled
+// font via troika's caret metrics, so the paragraph flow uses the font's true
+// glyph advances rather than an assumed constant.
+function measureMonoAdvance(cb: () => void): void {
+  const probe = new TroikaText();
+  probe.text = 'MMMMMMMMMM';
+  probe.font = PARA_FONT_URL;
+  probe.fontSize = 1; // measure per-em
+  probe.anchorX = 'left';
+  probe.anchorY = 'middle';
+  probe.sync(() => {
+    const cp = probe.textRenderInfo?.caretPositions as Float32Array | undefined;
+    if (cp && cp.length >= 8) {
+      // caretPositions: 4 floats per char (startX, endX, …). Monospace → every
+      // glyph shares one advance; average across the run for a robust value.
+      const n = cp.length / 4;
+      let sum = 0;
+      for (let i = 0; i < n; i++) sum += cp[i * 4 + 1] - cp[i * 4];
+      const adv = sum / n;
+      if (adv > 0.3 && adv < 0.9) MONO_ADVANCE = adv;
+    }
+    probe.dispose();
+    cb();
+  });
+}
+
 new FontLoader().load(`${import.meta.env.BASE_URL}fonts/helvetiker_bold.typeface.json`, (loaded) => {
   font = loaded;
-  restart();
-  animate();
+  // Warm troika's glyph/SDF cache for the alphabet, measure the advance, then
+  // build the first test so the paragraph packs with real metrics from frame 1.
+  preloadFont(
+    { font: PARA_FONT_URL, characters: 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ' },
+    () => {
+      measureMonoAdvance(() => {
+        restart();
+        animate();
+      });
+    },
+  );
 });

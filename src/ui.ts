@@ -30,6 +30,7 @@ export interface UICallbacks {
   restart(): void;
   onMenuOpen(): void;
   onMenuClose(): void;
+  onFocusRestore(): void; // user clicked the "click to focus" overlay
 }
 
 // Builds and owns all DOM chrome: the live HUD, the gear button, the results
@@ -57,7 +58,14 @@ export function createUI(cb: UICallbacks) {
   gear.setAttribute('aria-label', 'settings');
   gear.addEventListener('click', () => openMenu());
 
-  root.append(hud, gear);
+  // --- focus-lost overlay (monkeytype-style "click to focus") -----------
+  const focusLost = el('div', 'focus-lost hidden');
+  const focusLine = el('div', 'focus-line');
+  focusLine.textContent = 'click to focus';
+  focusLost.appendChild(focusLine);
+  focusLost.addEventListener('click', () => cb.onFocusRestore());
+
+  root.append(hud, gear, focusLost);
 
   // --- results overlay --------------------------------------------------
   const results = el('div', 'overlay results hidden');
@@ -227,6 +235,12 @@ export function createUI(cb: UICallbacks) {
     },
     setHudVisible(v: boolean) {
       hud.style.opacity = v ? '' : '0';
+    },
+    showFocusLost() {
+      focusLost.classList.remove('hidden');
+    },
+    hideFocusLost() {
+      focusLost.classList.add('hidden');
     },
     showResults(st: ResultStats) {
       rWpm.textContent = String(st.wpm);

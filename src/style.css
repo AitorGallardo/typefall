@@ -31,6 +31,12 @@ body {
   width: 100%;
   height: 100%;
   display: block;
+  transition: filter 0.2s ease, opacity 0.2s ease;
+}
+/* Passage dims + blurs slightly while typing focus is lost (monkeytype-style). */
+#scene.blurred {
+  filter: blur(3px);
+  opacity: 0.55;
 }
 
 /* Invisible capture input — keeps mobile soft keyboards open. */
@@ -119,6 +125,32 @@ body {
 .gear:hover {
   color: var(--accent);
   border-color: var(--accent);
+}
+
+/* ---- focus-lost overlay ("click to focus") ---- */
+.focus-lost {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: auto;
+  cursor: pointer;
+  z-index: 3;
+}
+.focus-lost.hidden {
+  display: none;
+}
+.focus-line {
+  font-size: 13px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--dim);
+  padding: 8px 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(10, 10, 10, 0.55);
+  user-select: none;
 }
 
 /* ---- overlays ---- */
