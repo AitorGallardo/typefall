@@ -65,11 +65,15 @@ const OP_UPCOMING = 0.6;
 const OP_COMPLETED = 0.42;
 
 // --- stream layout ---
-const BASE_Y = 4.2;
-const Z_GAP = 5.4;
-const Y_RISE = 0.42;
-const SCALE_FALLOFF = 0.85;
-const WINDOW = 7; // visible upcoming words (including current)
+// Stream is the measured-flow engine (the same packing as paragraph) rendered
+// with the chunky extruded 3D glyphs instead of flat SDF text — "paragraph mode,
+// but chunky letters". Flat, upright rows on consistent baselines, uniform glyph
+// size (no depth scaling / receding), even word gaps, wrapped by real glyph
+// advances. Camera is static and dead-on so every letter faces it squarely.
+const STREAM_LINE_EM = 1.62; // line height (a touch taller than paragraph — the
+// extruded glyphs are bolder, so the extra leading keeps rows from ever touching)
+const STREAM_CENTER_BIAS = 0.06; // block lift above vertical center (fraction of view H)
+const STREAM_FONT_PX = 34; // target on-screen em height in CSS px (desktop)
 
 // Floor sits well below the text so falling debris and shadows stay out of the
 // reading zone — background flavor, not clutter.
@@ -86,9 +90,10 @@ const PARA_COL_MAX_PX = 1000; // …capped to this many CSS px (centered)
 const PARA_GAP_EM = 0.55; // inter-word gap (~one normal space)
 const PARA_LINE_EM = 1.42; // line height
 const PARA_VISIBLE = 3; // rows shown at once (active + the next two)
-const PARA_CENTER_BIAS = 0.05; // push the block this fraction of view height above center
-// (kept slight — the owner spec asks for "near visual center, slightly above if
-// necessary"; 0.05 keeps the block centered with fall room, not in the upper third)
+const PARA_CENTER_BIAS = 0.08; // push the block this fraction of view height above center
+// (the block reads centered-to-slightly-high: the middle of the three rows lands
+// ~42% down the viewport — comfortably above the vertical center — while leaving
+// ample fall room below. Tuned by projecting the middle row to screen space.)
 
 // The flat reading surface uses a real monospace typeface bundled locally (no
 // runtime CDN fetch) and rendered as SDF text by troika. Monospace means every
@@ -101,9 +106,13 @@ let MONO_ADVANCE = 0.6;
 
 // --- per-view cameras (fov chosen per view; paragraph is flat/near-orthographic
 // so rows stay parallel and letters keep a uniform size — the "tool" feel) ---
-const STREAM_CAM_BASE = new THREE.Vector3(0, 5.6, 13.5);
-const STREAM_CAM_LOOK = new THREE.Vector3(0, 4.0, -4);
-const STREAM_FOV = 50;
+// Stream shares the paragraph's dead-on framing (camera on the +z axis looking
+// straight down -z at the z=0 text plane) so rows stay parallel and every glyph
+// keeps one size — the only difference from paragraph is the glyph backend. The
+// fov is a touch wider than paragraph so the extruded depth still reads.
+const STREAM_CAM_BASE = new THREE.Vector3(0, 3.6, 26);
+const STREAM_CAM_LOOK = new THREE.Vector3(0, 3.6, 0);
+const STREAM_FOV = 34;
 const PARA_CAM_BASE = new THREE.Vector3(0, 3.6, 30);
 const PARA_CAM_LOOK = new THREE.Vector3(0, 3.6, 0);
 const PARA_FOV = 28;
@@ -632,200 +641,65 @@ function ensureSeq(n: number) {
   while (seq.length < n) seq.push(...buildSequence(60));
 }
 
-const tmpVec = new THREE.Vector3();
-
 // ---------------------------------------------------------------------------
-// Stream view — words fly in from the background toward the player.
+// Shared measured-flow engine — the packing / wrapping / scrolling that both the
+// paragraph and stream views run on. Words flow left→right and wrap by their
+// actual glyph width into a centered, px-consistent column; PARA_VISIBLE rows
+// show at once with the active line on top. Finishing the active line scrolls the
+// block up one line — deterministically — the finished line fading out above and
+// a fresh line fading in below. All coordinates derive from the camera frustum,
+// so the passage keeps its size and column at any resolution and never reflows on
+// a keystroke (only on a viewport resize).
+//
+// The two views differ ONLY in their glyph backend: paragraph renders flat SDF
+// text (troika); stream renders the chunky extruded 3D glyphs at a uniform size.
+// A FlowBackend captures those differences (camera, metrics, how a word is built
+// and measured, caret gaps) so the engine below stays one implementation.
 // ---------------------------------------------------------------------------
-function makeStreamView(): View {
-  interface StreamWord {
-    group: THREE.Group;
-    letters: LayoutLetter[];
-    targetSlot: number;
-  }
-  let visible: StreamWord[] = [];
-
-  function slotPos(slot: number, out: THREE.Vector3): THREE.Vector3 {
-    return out.set(0, BASE_Y + slot * Y_RISE, -slot * Z_GAP);
-  }
-  function slotScale(slot: number): number {
-    return Math.pow(SCALE_FALLOFF, slot);
-  }
-  function slotOpacity(slot: number): number {
-    if (slot <= 0) return 1;
-    return THREE.MathUtils.clamp(0.5 * Math.pow(0.72, slot - 1), 0.1, 1);
-  }
-
-  function addWord(seqIdx: number, slot: number): StreamWord {
-    const { group, letters } = createWord(seq[seqIdx]);
-    slotPos(slot, group.position);
-    group.scale.setScalar(slotScale(slot));
-    scene.add(group);
-    return { group, letters, targetSlot: slot };
-  }
-
-  // Colour the front (active) word from its per-char state; further words stay
-  // muted gray and are dimmed by the slot opacity.
-  function paint(): void {
-    const cur = visible[0];
-    if (!cur) return;
-    for (let i = 0; i < cur.letters.length; i++) {
-      const l = cur.letters[i];
-      if (i < letterIdx) letterStates[i] === 'correct' ? setGone(l) : setIncorrect(l);
-      else setCurrentUntyped(l);
-    }
-  }
-
-  // Build the initial window straight from wordIndex (0 on a fresh test).
-  const count = Math.min(WINDOW, seq.length);
-  for (let s = 0; s < count; s++) visible.push(addWord(wordIndex + s, s));
-  paint();
-
-  return {
-    camBase: STREAM_CAM_BASE,
-    camLook: STREAM_CAM_LOOK,
-    camFov: STREAM_FOV,
-    lockCamera: false,
-    tiltX: 0,
-    currentWord() {
-      const cur = visible[0];
-      return cur ? { group: cur.group, letters: cur.letters } : null;
-    },
-    paint,
-    advance() {
-      const gone = visible.shift();
-      if (gone) disposeWord(gone.group, gone.letters);
-      // Slide everyone forward one slot.
-      for (let k = 0; k < visible.length; k++) visible[k].targetSlot = k;
-      // Bring in a new word at the back if the sequence has one.
-      const backSeqIdx = wordIndex + WINDOW - 1;
-      if (settings.mode !== 'words') ensureSeq(backSeqIdx + 2);
-      if (backSeqIdx < seq.length) {
-        const w = addWord(backSeqIdx, WINDOW);
-        w.targetSlot = visible.length;
-        visible.push(w);
-      }
-      paint();
-    },
-    // Backspace stepped across a word boundary: the just-completed word was
-    // disposed on advance, so rebuild it at the front slot (wordIndex has already
-    // been decremented) and drop the tail word to keep the window bounded.
-    retreat() {
-      if (visible.length >= WINDOW) {
-        const back = visible.pop();
-        if (back) disposeWord(back.group, back.letters);
-      }
-      const front = addWord(wordIndex, 0);
-      visible.unshift(front);
-      for (let k = 0; k < visible.length; k++) visible[k].targetSlot = k;
-      paint();
-    },
-    boundaryGap() {
-      return LETTER_SPACING;
-    },
-    interLetterGap() {
-      return LETTER_SPACING;
-    },
-    caretDims() {
-      // The active word rests at slot 0 (scale 1), so the extruded glyphs are
-      // LETTER_SIZE tall; a chunky-ish bar reads well against them.
-      return { w: 0.09, h: LETTER_SIZE * 1.04 };
-    },
-    update(dt: number) {
-      const lerp = 1 - Math.pow(0.0015, dt);
-      for (const w of visible) {
-        slotPos(w.targetSlot, tmpVec);
-        w.group.position.lerp(tmpVec, lerp);
-        const ts = slotScale(w.targetSlot);
-        w.group.scale.setScalar(THREE.MathUtils.lerp(w.group.scale.x, ts, lerp));
-        const op = slotOpacity(w.targetSlot);
-        for (const l of w.letters) applyLetterVis(l, dt, op);
-      }
-    },
-    relayout() {
-      /* stream slots are camera-relative — nothing to recompute on resize */
-    },
-    dispose() {
-      for (const w of visible) disposeWord(w.group, w.letters);
-      visible = [];
-    },
-    info() {
-      return { view: 'stream', visible: visible.length };
-    },
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Paragraph view — a measured-flow layout engine, monkeytype's readability in
-// Typefall's 3D language. Words flow left→right and wrap by their actual glyph
-// width into a centered, px-consistent column; PARA_VISIBLE lines show at once
-// with the active line on top. Finishing the active line scrolls the block up
-// one line — deterministically — the finished line fading out above and a fresh
-// line fading in below. All coordinates derive from the camera frustum, so the
-// passage keeps its size and column at any resolution and never reflows on a
-// keystroke (only on a viewport resize).
-// ---------------------------------------------------------------------------
-interface ParaMetrics {
-  em: number; // glyph world height (troika fontSize); word groups are unscaled
-  advance: number; // monospace glyph advance, world units
+interface FlowMetrics {
+  em: number; // glyph world height
+  advance: number; // monospace glyph advance, world units (troika packing)
   colHalf: number; // half the reading-column width, world units
   gap: number; // inter-word gap, world units
   lineH: number; // line height, world units
   topY: number; // world y of the top (active) visible line
-  caretW: number; // caret bar width, world units (~2 CSS px)
+  caretW: number; // caret bar width, world units
+}
+interface FlowBackend {
+  view: 'paragraph' | 'stream';
+  camBase: THREE.Vector3;
+  camLook: THREE.Vector3;
+  camFov: number;
+  metrics(): FlowMetrics;
+  // World width of a word, for the greedy wrap decision (measured, not built).
+  wordWidth(text: string, m: FlowMetrics): number;
+  // Build a word group already sized to `m.em`; the engine positions it in x.
+  makeWord(text: string, m: FlowMetrics): { group: THREE.Group; letters: LayoutLetter[] };
+  // Caret gaps, expressed in the WORD GROUP's local frame (the engine feeds them
+  // to localToWorld through the group, which carries any backend scale).
+  boundaryGapLocal(m: FlowMetrics): number; // gap past the last glyph (word end)
+  interLetterGapLocal(): number; // gap between glyphs
+  caretH(m: FlowMetrics): number; // caret bar world height
 }
 
-function paraMetrics(): ParaMetrics {
-  // Camera looks straight down -z at the z=0 text plane, so the view distance
-  // to the plane is exactly the camera's z. Derive the visible frustum there.
-  const dist = PARA_CAM_BASE.z;
-  const visH = 2 * dist * Math.tan(((PARA_FOV * Math.PI) / 180) / 2);
-  const aspect = window.innerWidth / window.innerHeight;
-  const visW = visH * aspect;
-  const worldPerPx = visW / window.innerWidth;
-  // Narrow / portrait phones: bump the on-screen glyph size and widen the column
-  // fraction so the reading surface stays comfortable (three legible rows) rather
-  // than a short cramped ribbon.
-  const narrow = window.innerWidth < 640;
-  const fontPx = narrow ? 34 : PARA_FONT_PX;
-  const colVw = narrow ? 0.92 : PARA_COL_VW;
-  const em = fontPx * worldPerPx;
-  const advance = em * MONO_ADVANCE; // real monospace advance from the font metrics
-  const colWidth = Math.min(colVw * visW, PARA_COL_MAX_PX * worldPerPx);
-  const lineH = PARA_LINE_EM * em;
-  // Center the visible block (its middle row) slightly above the frustum's
-  // vertical center. The top row sits (PARA_VISIBLE-1)/2 line-heights above the
-  // middle row, so the term generalizes with PARA_VISIBLE instead of assuming 3.
-  const centerY = PARA_CAM_LOOK.y;
-  const topY = centerY + PARA_CENTER_BIAS * visH + (lineH * (PARA_VISIBLE - 1)) / 2;
-  return {
-    em,
-    advance,
-    colHalf: colWidth / 2,
-    gap: PARA_GAP_EM * em,
-    lineH,
-    topY,
-    caretW: Math.max(0.02, 2 * worldPerPx),
-  };
-}
-
-function makeParagraphView(): View {
-  interface ParaWord {
+function makeFlowView(backend: FlowBackend): View {
+  interface FlowWord {
     seqIndex: number;
     group: THREE.Group;
     letters: LayoutLetter[];
+    worldW: number; // laid-out world width (for the screen-space bbox export)
     opacity: number; // target opacity from typed-state
   }
-  interface ParaLine {
+  interface FlowLine {
     index: number;
     group: THREE.Group;
-    words: ParaWord[];
+    words: FlowWord[];
     start: number; // first seq index on this line
     end: number; // one past the last seq index on this line
     fade: number; // eased line-visibility factor
   }
-  let m = paraMetrics();
-  let lines: ParaLine[] = [];
+  let m = backend.metrics();
+  let lines: FlowLine[] = [];
   let top = 0; // index of the top (active) visible line
   let packSeq = 0; // next seq index to pack into a new line
   let packIdx = 0; // next line index to create
@@ -839,21 +713,28 @@ function makeParagraphView(): View {
   // word would exceed the column. Ragged right — never justified.
   function createLine(idx: number): void {
     const g = new THREE.Group();
-    g.position.set(0, rowY(idx), 0);
+    // Spawn one line-height below the resting row and let update() lerp it up into
+    // place. On a scroll every line rises by exactly one lineH in lockstep, so the
+    // incoming bottom line slides in from below instead of materializing on top of
+    // the line leaving that slot — the rows stay exactly one lineH apart at every
+    // frame of the transition (proven by the zero-overlap assertion). The initial
+    // rebuild snaps positions to rowY afterward, so this offset only shapes the
+    // live scroll entrance, never the resting layout.
+    g.position.set(0, rowY(idx) - m.lineH, 0);
     scene.add(g);
-    const words: ParaWord[] = [];
+    const words: FlowWord[] = [];
     const start = packSeq;
     let s = packSeq;
     let cursor = -m.colHalf; // left edge of the column
     for (;;) {
       if (settings.mode !== 'words') ensureSeq(s + 1);
       if (s >= seq.length) break;
-      const worldW = m.advance * seq[s].length; // monospace: advance × char count
+      const worldW = backend.wordWidth(seq[s], m);
       if (words.length > 0 && cursor + worldW > m.colHalf) break;
-      const { group, letters } = createTroikaWord(seq[s], m.em, m.advance);
+      const { group, letters } = backend.makeWord(seq[s], m);
       group.position.set(cursor + worldW / 2, 0, 0);
       g.add(group);
-      words.push({ seqIndex: s, group, letters, opacity: OP_UPCOMING });
+      words.push({ seqIndex: s, group, letters, worldW, opacity: OP_UPCOMING });
       cursor += worldW + m.gap;
       s++;
     }
@@ -864,7 +745,7 @@ function makeParagraphView(): View {
 
   function ensureLines(throughIdx: number): void {
     // In words mode the sequence is finite; stop once it is exhausted so we never
-    // manufacture trailing empty ParaLines past the last word. (time / zen extend
+    // manufacture trailing empty FlowLines past the last word. (time / zen extend
     // the sequence lazily inside createLine, so there is always another word.)
     while (packIdx <= throughIdx) {
       if (settings.mode === 'words' && packSeq >= seq.length) break;
@@ -911,11 +792,9 @@ function makeParagraphView(): View {
 
   // Rebuild the visible line packing (used on first build and on resize). Packs
   // forward from the active word — the new top line begins at wordIndex — so the
-  // cost is O(PARA_VISIBLE) rather than O(wordIndex): a resize at word 500 no
-  // longer re-measures and rebuilds meshes for all 500 preceding words. Progress
-  // is preserved (wordIndex / letterIdx / per-letter states); paint() re-applies
-  // every letter's state afterwards. The active word re-anchors to the start of
-  // the top row, which only shows on the rare viewport resize.
+  // cost is O(PARA_VISIBLE) rather than O(wordIndex). Progress is preserved
+  // (wordIndex / letterIdx / per-letter states); paint() re-applies every letter's
+  // state afterwards.
   function rebuild(): void {
     for (const l of lines) {
       for (const w of l.words) disposeWord(w.group, w.letters);
@@ -936,10 +815,10 @@ function makeParagraphView(): View {
   rebuild();
 
   return {
-    camBase: PARA_CAM_BASE,
-    camLook: PARA_CAM_LOOK,
-    camFov: PARA_FOV,
-    lockCamera: true,
+    camBase: backend.camBase,
+    camLook: backend.camLook,
+    camFov: backend.camFov,
+    lockCamera: true, // both flow views read on a static, dead-on surface
     tiltX: 0,
     currentWord() {
       for (const l of lines) {
@@ -973,15 +852,13 @@ function makeParagraphView(): View {
       paint();
     },
     boundaryGap() {
-      // Word groups are unscaled (troika renders at world size), so the world
-      // inter-word gap is the caret's local boundary gap directly.
-      return m.gap;
+      return backend.boundaryGapLocal(m);
     },
     interLetterGap() {
-      return 0; // monospace advance already bakes in side bearings — no extra gap
+      return backend.interLetterGapLocal();
     },
     caretDims() {
-      return { w: m.caretW, h: m.em * 1.05 };
+      return { w: m.caretW, h: backend.caretH(m) };
     },
     update(dt: number) {
       const posLerp = 1 - Math.pow(0.0009, dt);
@@ -1005,7 +882,7 @@ function makeParagraphView(): View {
       }
     },
     relayout() {
-      m = paraMetrics();
+      m = backend.metrics();
       rebuild();
     },
     dispose() {
@@ -1017,13 +894,39 @@ function makeParagraphView(): View {
     },
     info() {
       const active = lines.find((l) => l.index === top);
+      // Screen-space overlap check data: the world-space AABB of every word in a
+      // visible row (rows 0..PARA_VISIBLE-1). Rows animate on a line change, so the
+      // box y comes from the group's live position. A word spans its worldW around
+      // its group x and one em around the row y. The rows never overlap by
+      // construction; this export lets a test prove it (project + intersect).
+      const boxes: { seqIndex: number; row: number; x0: number; x1: number; y0: number; y1: number }[] = [];
+      for (const l of lines) {
+        // Export every live line (including a retiring row above and any row
+        // entering below), not just the resting band, so an overlap test can
+        // assert cleanliness through the scroll transitions too.
+        const row = l.index - top;
+        const ly = l.group.position.y;
+        for (const w of l.words) {
+          const cx = w.group.position.x;
+          boxes.push({
+            seqIndex: w.seqIndex,
+            row,
+            x0: cx - w.worldW / 2,
+            x1: cx + w.worldW / 2,
+            y0: ly - m.em / 2,
+            y1: ly + m.em / 2,
+          });
+        }
+      }
       return {
-        view: 'paragraph',
+        view: backend.view,
         topLine: top,
         lines: lines.length,
-        // Per-word line assignments and column geometry for test assertions.
         colHalf: m.colHalf,
+        em: +m.em.toFixed(4),
+        lineH: +m.lineH.toFixed(4),
         activeWords: active ? active.words.map((w) => w.seqIndex) : [],
+        boxes,
         rows: lines
           .slice()
           .sort((a, b) => a.index - b.index)
@@ -1031,6 +934,142 @@ function makeParagraphView(): View {
       };
     },
   };
+}
+
+// Stream view metrics — the paragraph derivation, but for the dead-on stream
+// camera and with the extruded glyphs' bolder leading. The glyph is scaled to the
+// same on-screen em; wrapping uses the real (variable) extruded advances.
+function streamMetrics(): FlowMetrics {
+  const dist = STREAM_CAM_BASE.z; // camera looks straight down -z at the z=0 plane
+  const visH = 2 * dist * Math.tan(((STREAM_FOV * Math.PI) / 180) / 2);
+  const aspect = window.innerWidth / window.innerHeight;
+  const visW = visH * aspect;
+  const worldPerPx = visW / window.innerWidth;
+  const narrow = window.innerWidth < 640;
+  const fontPx = narrow ? 40 : STREAM_FONT_PX;
+  const colVw = narrow ? 0.94 : 0.84;
+  const em = fontPx * worldPerPx;
+  const colWidth = Math.min(colVw * visW, PARA_COL_MAX_PX * worldPerPx);
+  const lineH = STREAM_LINE_EM * em;
+  const centerY = STREAM_CAM_LOOK.y;
+  const topY = centerY + STREAM_CENTER_BIAS * visH + (lineH * (PARA_VISIBLE - 1)) / 2;
+  return {
+    em,
+    advance: em * MONO_ADVANCE,
+    colHalf: colWidth / 2,
+    gap: PARA_GAP_EM * em,
+    lineH,
+    topY,
+    caretW: Math.max(0.03, 2.5 * worldPerPx), // ~2.5 CSS px — a touch heavier than paragraph
+  };
+}
+
+// World width of an extruded word at the target em: the same sum createWord lays
+// out (glyph advances + inter-letter spacing), scaled from build size to em.
+function extrudedWordWidth(text: string, m: FlowMetrics): number {
+  let w = 0;
+  for (const c of text) w += getGlyph(c).width;
+  w += LETTER_SPACING * Math.max(0, text.length - 1);
+  return w * (m.em / LETTER_SIZE);
+}
+
+// The extruded (stream) backend: chunky 3D glyphs, dead-on camera, uniform size.
+const STREAM_BACKEND: FlowBackend = {
+  view: 'stream',
+  camBase: STREAM_CAM_BASE,
+  camLook: STREAM_CAM_LOOK,
+  camFov: STREAM_FOV,
+  metrics: streamMetrics,
+  wordWidth: extrudedWordWidth,
+  makeWord(text, m) {
+    const { group, letters } = createWord(text);
+    group.scale.setScalar(m.em / LETTER_SIZE); // uniform on-screen size, no receding
+    return { group, letters };
+  },
+  // The word group is scaled by em/LETTER_SIZE, so a local gap of
+  // PARA_GAP_EM*LETTER_SIZE maps to the world gap PARA_GAP_EM*em — matching the
+  // packing gap and keeping caret placement identical to paragraph in feel.
+  boundaryGapLocal() {
+    return PARA_GAP_EM * LETTER_SIZE;
+  },
+  interLetterGapLocal() {
+    return LETTER_SPACING; // extruded glyphs are laid out with this spacing baked in
+  },
+  caretH(m) {
+    return m.em * 1.05;
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Paragraph view — the shared measured-flow engine with the flat SDF (troika)
+// glyph backend. Words groups are unscaled (troika renders at world em size), so
+// caret gaps are already in world units. This is the readable "tool" surface.
+// ---------------------------------------------------------------------------
+function paraMetrics(): FlowMetrics {
+  // Camera looks straight down -z at the z=0 text plane, so the view distance
+  // to the plane is exactly the camera's z. Derive the visible frustum there.
+  const dist = PARA_CAM_BASE.z;
+  const visH = 2 * dist * Math.tan(((PARA_FOV * Math.PI) / 180) / 2);
+  const aspect = window.innerWidth / window.innerHeight;
+  const visW = visH * aspect;
+  const worldPerPx = visW / window.innerWidth;
+  // Narrow / portrait phones: bump the on-screen glyph size and widen the column
+  // fraction so the reading surface stays comfortable (three legible rows) rather
+  // than a short cramped ribbon.
+  const narrow = window.innerWidth < 640;
+  const fontPx = narrow ? 34 : PARA_FONT_PX;
+  const colVw = narrow ? 0.92 : PARA_COL_VW;
+  const em = fontPx * worldPerPx;
+  const advance = em * MONO_ADVANCE; // real monospace advance from the font metrics
+  const colWidth = Math.min(colVw * visW, PARA_COL_MAX_PX * worldPerPx);
+  const lineH = PARA_LINE_EM * em;
+  // Center the visible block (its middle row) slightly above the frustum's
+  // vertical center. The top row sits (PARA_VISIBLE-1)/2 line-heights above the
+  // middle row, so the term generalizes with PARA_VISIBLE instead of assuming 3.
+  const centerY = PARA_CAM_LOOK.y;
+  const topY = centerY + PARA_CENTER_BIAS * visH + (lineH * (PARA_VISIBLE - 1)) / 2;
+  return {
+    em,
+    advance,
+    colHalf: colWidth / 2,
+    gap: PARA_GAP_EM * em,
+    lineH,
+    topY,
+    caretW: Math.max(0.02, 2 * worldPerPx),
+  };
+}
+
+// The flat SDF (troika) backend: monospace advance packing, unscaled groups.
+const PARA_BACKEND: FlowBackend = {
+  view: 'paragraph',
+  camBase: PARA_CAM_BASE,
+  camLook: PARA_CAM_LOOK,
+  camFov: PARA_FOV,
+  metrics: paraMetrics,
+  wordWidth(text, m) {
+    return m.advance * text.length; // monospace: advance × char count
+  },
+  makeWord(text, m) {
+    const { group, letters } = createTroikaWord(text, m.em, m.advance);
+    return { group, letters }; // troika renders at world size — group unscaled
+  },
+  boundaryGapLocal(m) {
+    return m.gap; // groups unscaled, so the local gap is the world gap directly
+  },
+  interLetterGapLocal() {
+    return 0; // monospace advance already bakes in side bearings
+  },
+  caretH(m) {
+    return m.em * 1.05;
+  },
+};
+
+// The two flow views are the shared engine bound to their glyph backend.
+function makeParagraphView(): View {
+  return makeFlowView(PARA_BACKEND);
+}
+function makeStreamView(): View {
+  return makeFlowView(STREAM_BACKEND);
 }
 
 // ---------------------------------------------------------------------------
@@ -1049,6 +1088,7 @@ interface CrawlMetrics {
   colHalf: number;
   gap: number;
   lineH: number;
+  lift: number; // world-Y translation of the tilted plane, to seat the reading band
 }
 function crawlMetrics(): CrawlMetrics {
   // The crawl is world-based (viewport-independent styling), but the tilted plane
@@ -1060,14 +1100,33 @@ function crawlMetrics(): CrawlMetrics {
   const aspect = window.innerWidth / window.innerHeight;
   const dist = 16; // ≈ camera-to-active-band distance (world units)
   const visHalfW = dist * Math.tan(((CRAWL_FOV * Math.PI) / 180) / 2) * aspect;
-  const colHalf = Math.min(CRAWL_COL_HALF, visHalfW * 0.86);
+  // Portrait clamps the column tighter: the entering lines below the active band
+  // sit nearer the camera and are magnified, so a column sized only for the active
+  // band overflows the side edges down there. A smaller fraction keeps even the
+  // nearest line inside the frame and pulls the ragged-left column off the edge
+  // toward center, where a narrow phone reads it comfortably.
+  const colFactor = aspect < 1 ? 0.66 : 0.86;
+  const colHalf = Math.min(CRAWL_COL_HALF, visHalfW * colFactor);
   const em = colHalf < 5 ? CRAWL_EM * 1.12 : CRAWL_EM;
+  // Seat the reading band higher on screen. Without a lift, the active line at
+  // t=0 (plane-local y=0 → world origin) projects near the bottom edge and the
+  // opening sentence is hard to read at rest. Translating the whole tilted plane
+  // up in world Y lifts the active line and the miss line together (their plane
+  // spacing is unchanged, so reading time is preserved) so the active line seats
+  // at ~40% from the top (≈60% viewport height) with the first 3-4 lines inside
+  // the comfortable reading zone. Vertical placement is aspect-independent (it
+  // rides the fixed vertical fov), but portrait gets a touch more lift so its
+  // bigger glyphs / extra wrapped lines all clear the lower edge. Verified by
+  // projecting the active line to screen space at 1440 and 390.
+  const portrait = aspect < 1;
+  const lift = portrait ? 3.3 : 3.0;
   return {
     em,
     advance: em * MONO_ADVANCE,
     colHalf,
     gap: PARA_GAP_EM * em,
     lineH: CRAWL_LINE_EM * em,
+    lift,
   };
 }
 
@@ -1116,6 +1175,7 @@ function makeCrawlView(): View {
   let m = crawlMetrics();
   const root = new THREE.Group();
   root.rotation.x = -CRAWL_TILT; // tilt the plane back so it vanishes upward
+  root.position.y = m.lift; // seat the reading band higher on screen (see crawlMetrics)
   scene.add(root);
   const stars = makeStarfield();
   scene.add(stars);
@@ -1222,6 +1282,7 @@ function makeCrawlView(): View {
     }
     lines = [];
     m = crawlMetrics();
+    root.position.y = m.lift; // re-seat the band for the new viewport
     missWorldY = CRAWL_MISS_LINEH * m.lineH;
     horizonWorldY = CRAWL_HORIZON_LINEH * m.lineH;
     packSeq = wordIndex;
