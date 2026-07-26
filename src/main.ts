@@ -18,28 +18,32 @@ import { detectHtmlInCanvas } from './htmlCanvas';
 //     opening crawl: the text plane tilts back and the lines climb it continuously
 //     toward a horizon fade, typed as they travel. A word that crosses the miss
 //     line still untyped is auto-missed (skipped-error semantics) and dissolves.
-//     A speed setting (0.8x–1.6x, or an auto WPM rubber-band) sets the climb rate.
+//     A speed setting (1x–2.5x, or an auto WPM rubber-band) sets the climb rate.
 //   • paragraph — the reading surface is flat SDF text (troika-three-text,
-//     JetBrains Mono): crisp, calm, tool-like. A measured-flow layout engine
+//     Space Mono): crisp, calm, tool-like. A measured-flow layout engine
 //     places words by their real monospace glyph advances into a centered column
-//     and shows three lines at once; the active word is bright with a thin green
-//     caret that smoothly lerps + blinks, upcoming words are muted, typed letters
-//     turn green, mistakes red, and finished lines scroll up.
+//     and shows three lines at once; the active word is bright with a thin
+//     liquid-gold caret that smoothly lerps + blinks, upcoming words are muted,
+//     typed letters exit the scene, mistakes stay red, and finished lines scroll up.
 //   • stream — upcoming words fly in from the background as chunky extruded 3D
 //     letters; the current word sits up front and the next few recede and dim.
-// Each correct keystroke locks the flat letter in place (green) and detaches a
-// chunky extruded 3D clone that blows away with the selected effect — that's
-// where Typefall's identity lives now — so the passage never reflows. A wrong
-// key turns the letter red and advances the caret; backspace restores letters in
-// the current word, which won't complete until every character is correct.
+// Each correct keystroke detaches a chunky extruded 3D clone that blows away with
+// the selected effect while the flat surface glyph fades out of its (reserved)
+// slot — that's where Typefall's identity lives now — so the passage never
+// reflows. A wrong key turns the letter red and advances the caret; backspace
+// restores letters in the current word, which won't complete until every
+// character is correct.
 // ---------------------------------------------------------------------------
 
 const BG = 0x0a0a0a;
 const WHITE = 0xe8e8ea;
-const GREEN = 0x22c55e;
+// gmsudo's warm-gold identity (matches the perforated-metal avatar). GOLD is the
+// core accent; the bright/dim tiers drive the liquid-gold caret sheen and glows.
+const GOLD = 0xd9a743; // core accent
+const GOLD_BRIGHT = 0xecc06a; // highlight / sheen crest
+const GOLD_DIM = 0x8a6a2a; // shadowed trough
 const RED = 0xef4444;
 const GRAY = 0x878d99; // upcoming words — muted but comfortably readable on black
-const PAST = 0x6b7280; // completed words — neutral dim gray (monkeytype past-text)
 const PAST_RED = 0x9b5555; // completed-word mistakes / skips — a dimmed red tint
 
 const LETTER_SIZE = 1.55;
@@ -47,10 +51,10 @@ const LETTER_SPACING = 0.1;
 
 // Self-lit emissive tiers, keyed by a letter's typing state. Each state is
 // readable regardless of scene lighting, and the tiers form monkeytype's
-// hierarchy: the active word leads, upcoming text recedes, typed text is the
-// green accent, mistakes are red, finished words sink to a quiet trail.
+// hierarchy: the active word leads, upcoming text recedes, mistakes are red,
+// finished words sink to a quiet trail. (Correct letters exit the scene, so they
+// need no tier of their own.)
 const EM_CURRENT = 0.42; // active word, not yet typed
-const EM_CORRECT = 0.34; // typed correctly — green accent
 const EM_INCORRECT = 0.5; // typed wrong — red until corrected
 const EM_UPCOMING = 0.07; // words further ahead — muted gray
 const EM_COMPLETED = 0.06; // finished words — subordinate
@@ -89,9 +93,9 @@ const PARA_CENTER_BIAS = 0.05; // push the block this fraction of view height ab
 // The flat reading surface uses a real monospace typeface bundled locally (no
 // runtime CDN fetch) and rendered as SDF text by troika. Monospace means every
 // glyph shares one advance, so the measured-flow packing is perfectly regular.
-const PARA_FONT_URL = `${import.meta.env.BASE_URL}fonts/JetBrainsMono-Regular.ttf`;
+const PARA_FONT_URL = `${import.meta.env.BASE_URL}fonts/SpaceMono-Regular.ttf`;
 // Advance width of one glyph as a fraction of the em, measured from the real
-// font at boot (see measureMonoAdvance). 0.6 is JetBrains Mono's true advance
+// font at boot (see measureMonoAdvance). 0.6 is Space Mono's true advance
 // and a safe fallback if the measurement font hasn't resolved yet.
 let MONO_ADVANCE = 0.6;
 
@@ -129,17 +133,17 @@ const CRAWL_HORIZON_LINEH = 7.5;
 const CRAWL_VISIBLE_AHEAD = 5; // lookahead lines packed below the active line
 // Climb rate. Numeric speed options multiply the base lines/second; 'auto' runs
 // a proportional controller that rubber-bands to the player's rolling WPM.
-const CRAWL_BASE_LPS = 0.16; // lines/second at 1x
+const CRAWL_BASE_LPS = 0.22; // lines/second at 1x (raised — the crawl reads faster now)
 const CRAWL_SPEED_FACTORS: Record<string, number> = {
-  '0.8': 0.8,
   '1': 1,
-  '1.25': 1.25,
-  '1.6': 1.6,
+  '1.4': 1.4,
+  '1.9': 1.9,
+  '2.5': 2.5,
 };
 const CRAWL_AVG_WPL = 6; // approx words per packed line (auto pace → line rate)
-const CRAWL_AUTO_CHASE = 0.9; // keep the miss line just behind the true pace
-const CRAWL_AUTO_MIN = 0.06; // lines/second clamp — never fully stall
-const CRAWL_AUTO_MAX = 0.5; // lines/second clamp — never run away
+const CRAWL_AUTO_CHASE = 0.88; // keep the miss line just behind the true pace
+const CRAWL_AUTO_MIN = 0.09; // lines/second clamp — never fully stall (raised with the base)
+const CRAWL_AUTO_MAX = 0.65; // lines/second clamp — never run away (raised with the base)
 const CRAWL_AUTO_TAU = 1.5; // controller smoothing time constant (s)
 
 const isTouch = matchMedia('(hover: none) and (pointer: coarse)').matches;
@@ -197,7 +201,7 @@ const rim = new THREE.DirectionalLight(0x60a5fa, 0.8);
 rim.position.set(-10, 6, -12);
 scene.add(rim);
 
-const accentFill = new THREE.PointLight(GREEN, 0.5, 44, 2);
+const accentFill = new THREE.PointLight(GOLD, 0.4, 44, 2);
 accentFill.position.set(-4, 3, 8);
 scene.add(accentFill);
 
@@ -295,13 +299,49 @@ function getGlyph(ch: string): Glyph {
 // ---------------------------------------------------------------------------
 // Caret
 // ---------------------------------------------------------------------------
-// A thin green vertical bar (unit box, scaled per-frame to the active word's
-// glyph size). It smoothly lerps to the next character boundary on every
-// keystroke and blinks at rest — monkeytype's smooth caret (see updateCaret).
-const caret = new THREE.Mesh(
-  new THREE.BoxGeometry(1, 1, 0.04),
-  new THREE.MeshBasicMaterial({ color: GREEN, transparent: true, opacity: 0.9 }),
-);
+// A thin vertical bar (unit box, scaled per-frame to the active word's glyph
+// size). It smoothly lerps to the next character boundary on every keystroke and
+// blinks at rest — monkeytype's smooth caret (see updateCaret). Its liquid-gold
+// sheen is the site's signature touch: a warm gold ramp (dim → core → bright)
+// that flows up the bar on a slow ~3s cycle, driven by the frame clock so it
+// animates even when the automation tab suspends rAF. On an overflow-reject it
+// swells and turns red instead.
+const caretMat = new THREE.ShaderMaterial({
+  transparent: true,
+  depthWrite: false,
+  uniforms: {
+    uTime: { value: 0 },
+    uOpacity: { value: 0.9 },
+    uRed: { value: 0 },
+    uDim: { value: new THREE.Color(GOLD_DIM) },
+    uCore: { value: new THREE.Color(GOLD) },
+    uBright: { value: new THREE.Color(GOLD_BRIGHT) },
+    uErr: { value: new THREE.Color(RED) },
+  },
+  vertexShader: `
+    varying vec2 vUv;
+    void main() {
+      vUv = uv;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }
+  `,
+  fragmentShader: `
+    uniform float uTime; uniform float uOpacity; uniform float uRed;
+    uniform vec3 uDim; uniform vec3 uCore; uniform vec3 uBright; uniform vec3 uErr;
+    varying vec2 vUv;
+    void main() {
+      // Molten flow: a gold band travels up the bar every ~3s. Two mixes give a
+      // dim trough → core → bright crest ramp so it reads as flowing metal.
+      float t = vUv.y * 1.3 - uTime * 0.33;
+      float s = 0.5 + 0.5 * sin(t * 6.28318);
+      vec3 gold = mix(uDim, uCore, smoothstep(0.0, 0.6, s));
+      gold = mix(gold, uBright, smoothstep(0.6, 1.0, s));
+      vec3 col = mix(gold, uErr, uRed);
+      gl_FragColor = vec4(col, uOpacity);
+    }
+  `,
+});
+const caret = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 0.04), caretMat);
 caret.visible = false;
 caret.renderOrder = 10;
 scene.add(caret);
@@ -334,6 +374,13 @@ interface LayoutLetter {
   localX: number; // x of the glyph centre within the word group (local units)
   halfWidth: number; // half advance (local units)
   state: LetterState;
+  // Per-letter visibility, eased toward visTarget each frame. A correct keystroke
+  // sets visTarget → 0 so the surface glyph fades out (~80ms) and exits the scene
+  // as its effect clone carries it away — no green glyph is left behind. Its
+  // layout slot stays reserved (zero reflow). Backspace restores visTarget → 1 so
+  // the glyph returns as an untyped gray. Incorrect / skipped letters keep 1.
+  vis: number; // current eased visibility 0..1
+  visTarget: number; // 1 visible · 0 gone
   // World scale to give the extruded clone so it matches the on-screen glyph.
   // undefined → derive from the object's live world scale (stream, where words
   // fly and scale over time); a number → fixed (paragraph, group scale is 1).
@@ -379,6 +426,8 @@ function createWord(
       localX,
       halfWidth: widths[i] / 2,
       state: 'untyped',
+      vis: 1,
+      visTarget: 1,
       applyColor(color, emissive) {
         mat.color.setHex(color);
         mat.emissive.setHex(color);
@@ -432,6 +481,8 @@ function createTroikaWord(
       localX,
       halfWidth: advance / 2,
       state: 'untyped',
+      vis: 1,
+      visTarget: 1,
       cloneScale,
       applyColor(color) {
         t.color = color;
@@ -457,34 +508,49 @@ function disposeWord(group: THREE.Group, letters: LayoutLetter[]) {
 }
 
 // --- per-state colouring (colour + emissive tier; opacity is a view concern) ---
+// Every visible-state helper also claims visTarget = 1 so a letter that returns
+// from a correct state (backspace) fades back in; setGone is the only one that
+// hides. Colour is left untouched for gone letters so nothing flashes on the way
+// out.
 function setUpcoming(l: LayoutLetter) {
   l.applyColor(GRAY, EM_UPCOMING);
+  l.visTarget = 1;
 }
 function setCurrentUntyped(l: LayoutLetter) {
   l.applyColor(WHITE, EM_CURRENT);
+  l.visTarget = 1;
 }
-function setCorrect(l: LayoutLetter) {
-  l.applyColor(GREEN, EM_CORRECT);
+// A correctly-typed glyph exits the scene: its effect clone carries it away while
+// the surface glyph fades out over ~80ms and its slot stays reserved. No green (or
+// gold) glyph is ever left in the passage — the reading surface empties as you type.
+function setGone(l: LayoutLetter) {
+  l.visTarget = 0;
 }
 function setIncorrect(l: LayoutLetter) {
   l.applyColor(RED, EM_INCORRECT);
-}
-// Completed word, letter typed correctly — sinks to a neutral dim gray (the
-// monkeytype past-text look), not green. Only the active word's correct prefix
-// stays green; finished text recedes so the eye tracks the live word.
-function setCompleted(l: LayoutLetter) {
-  l.applyColor(PAST, EM_COMPLETED);
+  l.visTarget = 1;
 }
 // Completed word, letter that was wrong or skipped — a dimmed red tint so past
-// mistakes stay visible without shouting over the live word.
+// mistakes stay visible without shouting over the live word. (Correctly-typed
+// letters in a finished word are already gone.)
 function setPastError(l: LayoutLetter) {
   l.applyColor(PAST_RED, EM_COMPLETED + 0.04);
+  l.visTarget = 1;
+}
+
+// Ease a letter's visibility toward its target and apply the view's base opacity.
+// Correct letters fade to nothing (~80ms); everything else eases to full. Called
+// once per letter per frame from each view's update().
+const VIS_TAU = 0.028; // ≈80ms to fade a just-typed glyph out
+function applyLetterVis(l: LayoutLetter, dt: number, base: number) {
+  l.vis += (l.visTarget - l.vis) * (1 - Math.exp(-dt / VIS_TAU));
+  l.setOpacity(base * l.vis);
 }
 
 // Spawn a flying clone of a just-typed letter at its exact on-screen transform
-// and hand it to the effect system. The original letter is left in place (it
-// turns green and holds its layout slot), so the passage never reflows and
-// backspace can restore the letter to an untyped state.
+// and hand it to the effect system. The original surface glyph fades out and its
+// slot stays reserved (so the passage never reflows), while this clone carries the
+// letter away with the chosen effect. Backspace fades the surface glyph back in.
 function detachClone(l: LayoutLetter, effect: EffectId) {
   const src = l.object3d;
   src.updateWorldMatrix(true, false);
@@ -544,7 +610,7 @@ let seq: string[] = [];
 let wordIndex = 0; // index in seq of the current word
 let letterIdx = 0; // cursor within the current word (chars committed, right or wrong)
 // Per-char states of the letters already committed in the current word. Kept at
-// module scope so a viewport relayout can restore red/green after a rebuild.
+// module scope so a viewport relayout can restore each letter's typed state after a rebuild.
 let letterStates: LetterState[] = [];
 // Per-word committed states of already-finished words, kept so backspace can step
 // back into an imperfect previous word and restore its letters for re-editing.
@@ -605,7 +671,7 @@ function makeStreamView(): View {
     if (!cur) return;
     for (let i = 0; i < cur.letters.length; i++) {
       const l = cur.letters[i];
-      if (i < letterIdx) letterStates[i] === 'correct' ? setCorrect(l) : setIncorrect(l);
+      if (i < letterIdx) letterStates[i] === 'correct' ? setGone(l) : setIncorrect(l);
       else setCurrentUntyped(l);
     }
   }
@@ -673,7 +739,7 @@ function makeStreamView(): View {
         const ts = slotScale(w.targetSlot);
         w.group.scale.setScalar(THREE.MathUtils.lerp(w.group.scale.x, ts, lerp));
         const op = slotOpacity(w.targetSlot);
-        for (const l of w.letters) l.setOpacity(op);
+        for (const l of w.letters) applyLetterVis(l, dt, op);
       }
     },
     relayout() {
@@ -717,9 +783,15 @@ function paraMetrics(): ParaMetrics {
   const aspect = window.innerWidth / window.innerHeight;
   const visW = visH * aspect;
   const worldPerPx = visW / window.innerWidth;
-  const em = PARA_FONT_PX * worldPerPx;
+  // Narrow / portrait phones: bump the on-screen glyph size and widen the column
+  // fraction so the reading surface stays comfortable (three legible rows) rather
+  // than a short cramped ribbon.
+  const narrow = window.innerWidth < 640;
+  const fontPx = narrow ? 34 : PARA_FONT_PX;
+  const colVw = narrow ? 0.92 : PARA_COL_VW;
+  const em = fontPx * worldPerPx;
   const advance = em * MONO_ADVANCE; // real monospace advance from the font metrics
-  const colWidth = Math.min(PARA_COL_VW * visW, PARA_COL_MAX_PX * worldPerPx);
+  const colWidth = Math.min(colVw * visW, PARA_COL_MAX_PX * worldPerPx);
   const lineH = PARA_LINE_EM * em;
   // Center the visible block (its middle row) slightly above the frustum's
   // vertical center. The top row sits (PARA_VISIBLE-1)/2 line-heights above the
@@ -807,18 +879,19 @@ function makeParagraphView(): View {
     return top;
   }
 
-  // Apply the state hierarchy: completed words sink to a quiet trail, upcoming
-  // words are muted gray, the active word is bright with its typed prefix in
-  // green / red. Colour only — opacity is eased per-frame in update().
+  // Apply the state hierarchy: completed words sink to a quiet trail (correct
+  // letters gone, mistakes red-tinted), upcoming words are muted gray, the active
+  // word is bright with its correct letters exited and its mistakes red. Colour +
+  // visibility target only — opacity is eased per-frame in update().
   function paint(): void {
     for (const l of lines) {
       for (const w of l.words) {
         if (w.seqIndex < wordIndex) {
-          // Past text: neutral dim gray, but keep wrong / skipped letters red-tinted.
+          // Past text: correct letters are already gone; keep wrong / skipped red.
           w.opacity = OP_COMPLETED;
           for (const ll of w.letters) {
             if (ll.state === 'incorrect' || ll.state === 'skipped') setPastError(ll);
-            else setCompleted(ll);
+            else setGone(ll);
           }
         } else if (w.seqIndex > wordIndex) {
           w.opacity = OP_UPCOMING;
@@ -827,8 +900,8 @@ function makeParagraphView(): View {
           w.opacity = OP_CURRENT;
           for (let i = 0; i < w.letters.length; i++) {
             const ll = w.letters[i];
-            // A committed letter is green only if correct; wrong or skipped is red.
-            if (i < letterIdx) letterStates[i] === 'correct' ? setCorrect(ll) : setIncorrect(ll);
+            // A correct letter has exited the scene; wrong / skipped stays red.
+            if (i < letterIdx) letterStates[i] === 'correct' ? setGone(ll) : setIncorrect(ll);
             else setCurrentUntyped(ll);
           }
         }
@@ -856,6 +929,8 @@ function makeParagraphView(): View {
     // Snap lines straight to their resting rows so a resize doesn't animate.
     for (const l of lines) l.group.position.y = rowY(l.index);
     paint();
+    // Snap visibility too, so already-typed (gone) letters don't fade back in.
+    for (const l of lines) for (const w of l.words) for (const ll of w.letters) ll.vis = ll.visTarget;
   }
 
   rebuild();
@@ -919,7 +994,7 @@ function makeParagraphView(): View {
         const fadeTarget = row >= 0 && row < PARA_VISIBLE ? 1 : 0;
         l.fade = THREE.MathUtils.lerp(l.fade, fadeTarget, opLerp);
         for (const w of l.words) {
-          for (const ll of w.letters) ll.setOpacity(w.opacity * l.fade);
+          for (const ll of w.letters) applyLetterVis(ll, dt, w.opacity * l.fade);
         }
         // Retire a line once it has scrolled clear above the active line.
         if (row < 0 && l.fade < 0.02) {
@@ -976,11 +1051,21 @@ interface CrawlMetrics {
   lineH: number;
 }
 function crawlMetrics(): CrawlMetrics {
-  const em = CRAWL_EM;
+  // The crawl is world-based (viewport-independent styling), but the tilted plane
+  // still has to fit the screen: on a narrow / portrait phone the horizontal
+  // frustum is much smaller than on a wide desktop, so clamp the reading column
+  // to what's actually visible at the active reading band and bump the glyph a
+  // touch when the column gets tight — so lines wrap to ~2-3 words that read big
+  // and clear rather than running off both edges.
+  const aspect = window.innerWidth / window.innerHeight;
+  const dist = 16; // ≈ camera-to-active-band distance (world units)
+  const visHalfW = dist * Math.tan(((CRAWL_FOV * Math.PI) / 180) / 2) * aspect;
+  const colHalf = Math.min(CRAWL_COL_HALF, visHalfW * 0.86);
+  const em = colHalf < 5 ? CRAWL_EM * 1.12 : CRAWL_EM;
   return {
     em,
     advance: em * MONO_ADVANCE,
-    colHalf: CRAWL_COL_HALF,
+    colHalf,
     gap: PARA_GAP_EM * em,
     lineH: CRAWL_LINE_EM * em,
   };
@@ -999,7 +1084,7 @@ function makeStarfield(): THREE.Points {
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
   const mat = new THREE.PointsMaterial({
-    color: 0x8a8f99,
+    color: 0x9a9184, // a barely-warm gold hint, not the old cool blue-gray
     size: 0.16,
     sizeAttenuation: true,
     transparent: true,
@@ -1028,7 +1113,7 @@ function makeCrawlView(): View {
     end: number;
   }
 
-  const m = crawlMetrics();
+  let m = crawlMetrics();
   const root = new THREE.Group();
   root.rotation.x = -CRAWL_TILT; // tilt the plane back so it vanishes upward
   scene.add(root);
@@ -1040,8 +1125,8 @@ function makeCrawlView(): View {
   let packSeq = 0;
   let packIdx = 0;
 
-  const missWorldY = CRAWL_MISS_LINEH * m.lineH;
-  const horizonWorldY = CRAWL_HORIZON_LINEH * m.lineH;
+  let missWorldY = CRAWL_MISS_LINEH * m.lineH;
+  let horizonWorldY = CRAWL_HORIZON_LINEH * m.lineH;
   function rowY(li: number): number {
     return (scroll - li) * m.lineH;
   }
@@ -1107,7 +1192,7 @@ function makeCrawlView(): View {
           w.opacity = OP_COMPLETED;
           for (const ll of w.letters) {
             if (ll.state === 'incorrect' || ll.state === 'skipped') setPastError(ll);
-            else setCompleted(ll);
+            else setGone(ll);
           }
         } else if (w.seqIndex > wordIndex) {
           w.opacity = OP_UPCOMING;
@@ -1116,7 +1201,7 @@ function makeCrawlView(): View {
           w.opacity = OP_CURRENT;
           for (let i = 0; i < w.letters.length; i++) {
             const ll = w.letters[i];
-            if (i < letterIdx) letterStates[i] === 'correct' ? setCorrect(ll) : setIncorrect(ll);
+            if (i < letterIdx) letterStates[i] === 'correct' ? setGone(ll) : setIncorrect(ll);
             else setCurrentUntyped(ll);
           }
         }
@@ -1126,6 +1211,26 @@ function makeCrawlView(): View {
 
   ensureLinesForScroll();
   paint();
+
+  // Recompute metrics for the current viewport and re-pack from the active word
+  // (the active line re-enters near the bottom). Used on resize / device rotation
+  // so the column keeps fitting the screen; progress (wordIndex / states) is kept.
+  function rebuild(): void {
+    for (const l of lines) {
+      for (const w of l.words) disposeWord(w.group, w.letters);
+      l.group.removeFromParent();
+    }
+    lines = [];
+    m = crawlMetrics();
+    missWorldY = CRAWL_MISS_LINEH * m.lineH;
+    horizonWorldY = CRAWL_HORIZON_LINEH * m.lineH;
+    packSeq = wordIndex;
+    packIdx = 0;
+    scroll = 0;
+    ensureLinesForScroll();
+    paint();
+    for (const l of lines) for (const w of l.words) for (const ll of w.letters) ll.vis = ll.visTarget;
+  }
 
   // Plane-local Y of the line currently holding the active word, in line-heights
   // — the miss loop watches this cross CRAWL_MISS_LINEH.
@@ -1183,7 +1288,7 @@ function makeCrawlView(): View {
         const y = rowY(l.index);
         l.group.position.y = y;
         const fade = fadeFor(y);
-        for (const w of l.words) for (const ll of w.letters) ll.setOpacity(w.opacity * fade);
+        for (const w of l.words) for (const ll of w.letters) applyLetterVis(ll, dt, w.opacity * fade);
         if (y > horizonWorldY) {
           for (const w of l.words) disposeWord(w.group, w.letters);
           l.group.removeFromParent();
@@ -1196,7 +1301,7 @@ function makeCrawlView(): View {
       stars.position.x = Math.sin(animClock * 0.05) * 1.5;
     },
     relayout() {
-      /* crawl sizing is world-based (viewport-independent) — nothing to redo */
+      rebuild(); // re-fit the tilted column to the new viewport (keeps progress)
     },
     dispose() {
       for (const l of lines) {
@@ -1260,7 +1365,7 @@ const HIST_PREFIX = 'typefall.hist.v1:';
 
 function configKey(): string {
   const amount = settings.mode === 'time' ? settings.time : settings.mode === 'words' ? settings.words : 0;
-  // Crawl chases its own best per speed setting — a 1.6x run and an auto run are
+  // Crawl chases its own best per speed setting — a 2.5x run and an auto run are
   // different challenges, so each keeps a separate highscore.
   if (settings.view === 'crawl') return `${settings.mode}:${amount}:crawl:${settings.speed}`;
   return `${settings.mode}:${amount}:${settings.view}`;
@@ -1374,16 +1479,19 @@ function handleChar(ch: string) {
   beginIfNeeded();
 
   if (ch.toLowerCase() === pending.ch.toLowerCase()) {
-    // Correct: the original locks in green (holding its slot) and a clone blows
-    // away with the chosen effect — Typefall's signature, without reflow.
+    // Correct: a clone peels off and blows away with the chosen effect while the
+    // surface glyph fades out of its (reserved) slot — Typefall's signature,
+    // without reflow. setGone (via paint) drives the fade.
     detachClone(pending, settings.effect);
     pending.state = 'correct';
-    setCorrect(pending);
+    setGone(pending);
     letterStates[letterIdx] = 'correct';
     state.correct++;
-    wpmSamples.push(animClock); // feed the crawl auto-speed rolling window
+    wpmSamples.push(animClock); // feed the star-wars auto-speed rolling window
     letterIdx++;
-    if (letterIdx >= w.letters.length && allCurrentCorrect()) completeWord();
+    // In 'auto' advance the word jumps to the next the instant its last letter
+    // lands correct; in 'space' (default) it waits for a deliberate space.
+    if (settings.advance === 'auto' && letterIdx >= w.letters.length && allCurrentCorrect()) completeWord();
     else activeView.paint();
   } else {
     // Wrong: the letter turns red and the caret advances (monkeytype default);
@@ -1440,9 +1548,12 @@ function handleBackspace() {
 
 // Space is the deliberate word-advance (monkeytype semantics). With no character
 // typed it is a no-op; otherwise it advances, marking any untyped remainder of the
-// current word as skipped errors (each costs a keystroke), and the word finishes
-// imperfect. A word that was already all-correct auto-advances on its last letter,
-// so space there simply falls through as a boundary no-op.
+// current word as skipped errors (each costs a keystroke) if the word was partial
+// or imperfect, or advancing cleanly if it was all-correct. In 'space' mode (the
+// default) this is how every word — even a perfect one — advances; in 'auto' mode
+// a perfect word has already jumped on its last letter, so space there only fires
+// on an imperfect word. Either way advanceWord credits exactly one keystroke for
+// the boundary (the real space here, or the implicit space in auto), never both.
 function handleSpace() {
   if (state.phase === 'finished') return;
   if (ui.isMenuOpen()) return;
@@ -1658,10 +1769,10 @@ function finish() {
 }
 
 // Let a few letters rain behind the results — small and dim so the stats read
-// clean. On a new personal best they tint green and a single restrained particle
+// clean. On a new personal best they tint gold and a single restrained particle
 // burst fires at the score (the dopamine hit, no confetti spam).
 function rainResultLetters(newPb: boolean) {
-  const tint = newPb ? GREEN : WHITE;
+  const tint = newPb ? GOLD : WHITE;
   const chars = 'typefall'.split('');
   for (let i = 0; i < chars.length; i++) {
     const glyph = getGlyph(chars[i]);
@@ -1682,7 +1793,7 @@ function rainResultLetters(newPb: boolean) {
     const half = new CANNON.Vec3(glyph.half.x * 0.6, glyph.half.y * 0.6, glyph.half.z * 0.6);
     effects.rain(mesh, { color: new THREE.Color(tint), half });
   }
-  if (newPb) effects.burst(0, 4.2, 1, new THREE.Color(GREEN));
+  if (newPb) effects.burst(0, 4.2, 1, new THREE.Color(GOLD));
 }
 
 // ---------------------------------------------------------------------------
@@ -1865,14 +1976,13 @@ function updateCaret(dt: number) {
   caret.scale.set(dims.w * (1 + 0.9 * pulse), dims.h, 1);
   caret.rotation.set(activeView.tiltX, 0, 0); // match a tilted reading plane (crawl)
 
-  const mat = caret.material as THREE.MeshBasicMaterial;
   let opacity: number;
   if (pulse > 0.05) {
     // Overflow pulse — swell and redden so rejected input is felt.
-    mat.color.setHex(RED);
+    caretMat.uniforms.uRed.value = 1;
     opacity = 1;
   } else {
-    mat.color.setHex(GREEN);
+    caretMat.uniforms.uRed.value = 0;
     if (animClock - lastTypeClock < CARET_TYPE_PAUSE) {
       opacity = 1; // solid while typing (and just after), like monkeytype
     } else {
@@ -1881,7 +1991,9 @@ function updateCaret(dt: number) {
       opacity = 0.12 + 0.88 * (0.5 + 0.5 * Math.cos(phase * Math.PI * 2));
     }
   }
-  mat.opacity = opacity;
+  // Frame-clock driven so the molten sheen flows even while rAF is suspended.
+  caretMat.uniforms.uTime.value = animClock;
+  caretMat.uniforms.uOpacity.value = opacity;
 
   caretState.visible = true;
   caretState.x = +caret.position.x.toFixed(3);

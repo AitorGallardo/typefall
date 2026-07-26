@@ -9,7 +9,8 @@ import { REAL_EFFECTS } from './settings';
 // reused box shards, and cannon-es bodies only where real piling matters.
 
 const WHITE = new THREE.Color(0xe8e8ea);
-const GREEN = new THREE.Color(0x22c55e);
+// gmsudo's warm gold — the accent sparks in explode / the launch trail.
+const GOLD = new THREE.Color(0xd9a743);
 const ASH = new THREE.Color(0x9aa0a6);
 
 export interface PlayOpts {
@@ -190,7 +191,7 @@ export class EffectSystem {
     for (let i = 0; i < n; i++) {
       const dir = randDir();
       const speed = 4 + Math.random() * 7;
-      const c = Math.random() < 0.35 ? GREEN : opts.color;
+      const c = Math.random() < 0.35 ? GOLD : opts.color;
       this.emit(p.x, p.y, p.z, dir.x * speed, dir.y * speed, dir.z * speed, c, 0.55 + Math.random() * 0.25, 9);
     }
     this.removeMesh(mesh);
@@ -404,9 +405,9 @@ export class EffectSystem {
         a.vel.y += 8 * dt; // accelerate skyward
         a.mesh.position.addScaledVector(a.vel, dt);
         a.mesh.rotation.z += dt * 4;
-        // Green trail.
+        // Gold trail.
         const p = a.mesh.position;
-        this.emit(p.x, p.y - 0.6, p.z, (Math.random() - 0.5) * 0.6, -1, (Math.random() - 0.5) * 0.6, GREEN, 0.4, 2);
+        this.emit(p.x, p.y - 0.6, p.z, (Math.random() - 0.5) * 0.6, -1, (Math.random() - 0.5) * 0.6, GOLD, 0.4, 2);
         mat.opacity = Math.max(0, 1 - t * t);
       } else {
         // vortex: spiral inward toward the focus point and shrink.

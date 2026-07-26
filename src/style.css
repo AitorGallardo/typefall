@@ -1,10 +1,30 @@
+/* Space Mono, bundled locally (no CDN) — the reading surface uses the same face
+   via troika; the chrome below shares it through the font-family fallback chain. */
+@font-face {
+  font-family: "Space Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/SpaceMono-Regular.ttf") format("truetype");
+}
+@font-face {
+  font-family: "Space Mono";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("/fonts/SpaceMono-Bold.ttf") format("truetype");
+}
+
 :root {
   --bg: #0a0a0a;
   --text: #e5e7eb;
   --dim: #6b7280;
   --dimmer: #4b5563;
   --line: #1f2126;
-  --accent: #22c55e;
+  /* gmsudo warm gold — matches the perforated-metal avatar */
+  --accent: #d9a743;
+  --accent-bright: #ecc06a;
+  --accent-dim: #8a6a2a;
 }
 
 * {
@@ -19,7 +39,7 @@ body {
   overflow: hidden;
   background: var(--bg);
   color: var(--text);
-  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-family: "Space Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
   -webkit-font-smoothing: antialiased;
   overscroll-behavior: none;
   touch-action: none;
@@ -102,6 +122,34 @@ body {
   color: inherit;
 }
 
+/* live-wpm number in gold with a barely-there, slow molten sheen (~8s) — the
+   quietest of the three liquid-gold touches. */
+.hud-wpm {
+  background: linear-gradient(
+    100deg,
+    var(--accent-dim) 0%,
+    var(--accent) 42%,
+    var(--accent-bright) 50%,
+    var(--accent) 58%,
+    var(--accent-dim) 100%
+  );
+  background-size: 260% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+  animation: hudsheen 8s ease-in-out infinite;
+}
+@keyframes hudsheen {
+  0%,
+  100% {
+    background-position: 175% 0;
+  }
+  50% {
+    background-position: -75% 0;
+  }
+}
+
 .hud-sep {
   color: var(--dimmer);
   opacity: 0.6;
@@ -180,8 +228,33 @@ body {
   color: var(--accent);
   font-variant-numeric: tabular-nums;
 }
+/* New personal best: ONE liquid-gold shimmer sweep across the score — a bright
+   crest travels through the gold three times, then settles to solid gold. */
 .r-wpm.pb {
-  text-shadow: 0 0 30px rgba(34, 197, 94, 0.45);
+  background: linear-gradient(
+    100deg,
+    var(--accent) 0%,
+    var(--accent) 38%,
+    #fff4d6 50%,
+    var(--accent-bright) 58%,
+    var(--accent) 72%,
+    var(--accent) 100%
+  );
+  background-size: 300% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+  text-shadow: 0 0 34px rgba(217, 167, 67, 0.4);
+  animation: goldsweep 0.95s ease-in-out 3 forwards;
+}
+@keyframes goldsweep {
+  0% {
+    background-position: 210% 0;
+  }
+  100% {
+    background-position: -110% 0;
+  }
 }
 .r-label {
   font-size: 13px;
@@ -190,7 +263,7 @@ body {
   color: var(--dim);
   margin-bottom: 10px;
 }
-/* personal-best line — dim by default, unmistakable green when beaten */
+/* personal-best line — dim by default, unmistakable gold when beaten */
 .r-pb {
   font-size: 12px;
   letter-spacing: 0.12em;
@@ -295,6 +368,9 @@ body {
 .panel {
   min-width: 340px;
   max-width: 92vw;
+  max-height: 88vh;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
   background: #0c0c0e;
   border: 1px solid var(--line);
   border-radius: 12px;
@@ -348,7 +424,7 @@ body {
 }
 .opt.cursor {
   outline: none;
-  background: rgba(34, 197, 94, 0.1);
+  background: rgba(217, 167, 67, 0.12);
   color: var(--text);
   border-color: var(--accent);
 }
@@ -373,23 +449,46 @@ body {
   font-size: 11px;
 }
 
+/* Touch devices: every settings control clears the 44px minimum tap target and
+   the gear is easy to reach. */
+@media (hover: none) and (pointer: coarse) {
+  .opt {
+    min-height: 44px;
+    padding: 10px 16px;
+    font-size: 14px;
+  }
+  .p-restart {
+    min-height: 46px;
+  }
+  .gear {
+    width: 44px;
+    height: 44px;
+    font-size: 20px;
+  }
+}
+
 @media (max-width: 640px) {
   .hud {
     left: 14px;
     top: 14px;
-  }
-  .hud-primary {
-    font-size: 28px;
+    font-size: 12px;
   }
   .r-wpm {
     font-size: 68px;
   }
   .r-grid {
     grid-template-columns: repeat(2, 1fr);
-    gap: 18px;
+    gap: 16px 22px;
+    margin-bottom: 20px;
+  }
+  .results {
+    padding: 20px;
   }
   .panel {
     min-width: 0;
     width: 92vw;
+  }
+  .p-rowlabel {
+    flex-basis: 56px;
   }
 }
