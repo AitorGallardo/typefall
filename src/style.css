@@ -269,6 +269,23 @@ body {
   font-size: 12px;
   color: var(--dim);
 }
+/* tiny mono footer — which render path the results panel used */
+.r-footer {
+  margin-top: 12px;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--dimmer);
+  opacity: 0.6;
+  font-variant-numeric: tabular-nums;
+}
+/* html-in-canvas mirror active: the floating 3D panel is the picture, so the DOM
+   overlay slides off-screen — still laid out (so drawElement can rasterise it) and
+   still keyboard-focusable, exactly the source-of-truth pattern. Never applied
+   where the API is absent (the common case), so the DOM overlay is unchanged. */
+.results.panel-mirrored {
+  transform: translateX(-200vw);
+}
 
 /* ---- settings / menu ---- */
 .menu {
