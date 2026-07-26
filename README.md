@@ -1,14 +1,15 @@
 # typefall
 
 A 3D typing test. It works like [monkeytype](https://monkeytype.com), but the
-words are real extruded 3D letters. By default the upcoming text is laid out as
-a readable wall of rows facing you — the active word is bright with a green
-caret, the rest recede in brightness, and you read ahead just like on
-monkeytype. Type it. Every correct keystroke detaches that letter and blows it
-away with whatever completion effect you picked — it falls and piles on the
-floor, or bursts into particles, or rockets off with a green trail. Miss a
-letter and it flashes red, the camera flinches, and you stay put until you get
-it right.
+words are real extruded 3D letters. The default view is **star wars** — a
+Star Wars opening crawl: the passage tilts back and the lines climb toward a
+horizon, and you type each one before it slips past the miss line. The active
+word is bright with a thin liquid-gold caret. Type it. Every correct keystroke
+detaches a copy of that letter and blows it away with whatever completion effect
+you picked — it falls and piles on the floor, or bursts into particles, or
+rockets off — while the letter itself **exits the scene**: the surface glyph
+fades out of its slot (which stays reserved, so nothing reflows) and the passage
+empties as you type. Miss a letter and it stays red until you fix it.
 
 I built the first version as a toy where any key you pressed fell into the
 scene. I use monkeytype every day and wanted the same muscle memory, so I turned
@@ -26,16 +27,25 @@ restart — all rendered inside the 3D scene instead of on a flat page.
 
 ## Views
 
-How the upcoming text is presented. Set it in settings; it persists.
+How the text is presented. Set it in settings; it persists.
 
-- **paragraph** (default) — a monkeytype-style wall of three rows, laid out as
-  readable lines facing the camera. The active word is bright with the green
-  caret; finished words have been blown away; upcoming words are dimmer. When you
-  finish the active (top) line, the block scrolls up smoothly — the finished line
-  slides out, the next line slides in.
-- **stream** — the original presentation: words fly in from the background. The
-  current word sits up front, big and close; the next few recede into the dark
-  and dim out.
+- **star wars** (default) — a Star Wars opening crawl. The reading surface tilts
+  back and the lines climb continuously toward a horizon fade, typed as they
+  travel. A word that crosses the miss line still untyped is auto-missed and
+  dissolves into ash. A **speed** setting sets the climb rate: 1x, 1.4x, 1.9x,
+  2.5x, or **auto**, which rubber-bands the climb to your rolling WPM so the miss
+  line always sits just behind you. Each speed keeps its own personal best.
+- **paragraph** — a monkeytype-style wall of three rows, laid out as readable
+  lines facing the camera. Finish the active (top) line and the block scrolls up
+  one row — the finished line slides out, the next slides in.
+- **stream** — words fly in from the background. The current word sits up front,
+  big and close; the next few recede into the dark and dim out.
+
+## Advance
+
+- **space** (default) — a word advances when you press space, even if you typed
+  it perfectly. Skipped letters are marked as errors, monkeytype-style.
+- **auto** — an all-correct word advances the instant its last letter lands.
 
 ## Modes
 
@@ -51,12 +61,16 @@ Pick one, or pick **surprise** to rotate through them word by word:
 - **explode** — bursts into glowing particles that fade.
 - **disintegrate** — dissolves into ash that drifts up and out.
 - **vortex** — spirals away into a point behind the camera.
-- **launch** — rockets straight up with a green trail.
+- **launch** — rockets straight up with a gold trail.
 - **shatter** — splits into shards that spin off.
 
 ## Stack
 
-- [three.js](https://threejs.org) — rendering, `TextGeometry` for the letters.
+- [three.js](https://threejs.org) — rendering, `TextGeometry` for the chunky
+  3D letters and the flying clones.
+- [troika-three-text](https://github.com/protectwise/troika) — the flat SDF
+  reading surface, in [Space Mono](https://fonts.google.com/specimen/Space+Mono)
+  (bundled locally, no CDN).
 - [cannon-es](https://github.com/pmndrs/cannon-es) — physics, used only for the
   fall pile.
 - Vite + vanilla TypeScript. No framework.
