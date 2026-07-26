@@ -2,11 +2,17 @@
 // a mode, an amount for that mode, a completion effect, and an optional sound.
 
 export type ModeId = 'time' | 'words' | 'zen';
+// The 'crawl' id is kept internally (localStorage + per-config PB keys) for
+// continuity; its user-facing label is "star wars" (see VIEW_LABELS).
 export type ViewId = 'crawl' | 'paragraph' | 'stream';
-// Crawl-only line speed. The numeric options are multipliers on the base
+// Star-wars-only line speed. The numeric options are multipliers on the base
 // climb rate; 'auto' rubber-bands the crawl to the player's rolling WPM so the
 // miss line always chases just behind their true pace — a race against yourself.
-export type SpeedId = '0.8' | '1' | '1.25' | '1.6' | 'auto';
+export type SpeedId = '1' | '1.4' | '1.9' | '2.5' | 'auto';
+// Word-advance semantics. 'space' (default): a completed word — even all-correct
+// — waits for a deliberate space to advance, exactly like monkeytype's default.
+// 'auto': an all-correct word advances the instant its last letter lands.
+export type AdvanceId = 'space' | 'auto';
 export type EffectId =
   | 'fall'
   | 'explode'
@@ -22,7 +28,8 @@ export interface Settings {
   time: number; // seconds, time mode
   words: number; // count, words mode
   effect: EffectId;
-  speed: SpeedId; // crawl-only line speed
+  speed: SpeedId; // star-wars-only line speed
+  advance: AdvanceId; // when a word advances to the next
   sound: boolean;
 }
 
@@ -32,22 +39,29 @@ export const WORD_OPTIONS = [10, 25, 50];
 // crawl → a Star Wars opening crawl: the reading surface tilts back and the
 // lines climb continuously toward a horizon fade, typed as they travel;
 // paragraph → a calm monkeytype-style wall of rows; stream → words fly in from
-// the background. crawl is the default.
+// the background. crawl (labelled "star wars") is the default.
 export const VIEW_OPTIONS: ViewId[] = ['crawl', 'paragraph', 'stream'];
 export const VIEW_LABELS: Record<ViewId, string> = {
-  crawl: 'crawl',
+  crawl: 'star wars',
   paragraph: 'paragraph',
   stream: 'stream',
 };
 
-// Crawl speed picker. Numeric values are climb-rate multipliers; 'auto' hands
-// control to the WPM rubber-band controller.
-export const SPEED_OPTIONS: SpeedId[] = ['0.8', '1', '1.25', '1.6', 'auto'];
+// Star-wars speed picker. Numeric values are climb-rate multipliers on the base
+// rate; 'auto' hands control to the WPM rubber-band controller.
+export const SPEED_OPTIONS: SpeedId[] = ['1', '1.4', '1.9', '2.5', 'auto'];
 export const SPEED_LABELS: Record<SpeedId, string> = {
-  '0.8': '0.8x',
   '1': '1x',
-  '1.25': '1.25x',
-  '1.6': '1.6x',
+  '1.4': '1.4x',
+  '1.9': '1.9x',
+  '2.5': '2.5x',
+  auto: 'auto',
+};
+
+// Word-advance picker.
+export const ADVANCE_OPTIONS: AdvanceId[] = ['space', 'auto'];
+export const ADVANCE_LABELS: Record<AdvanceId, string> = {
+  space: 'space',
   auto: 'auto',
 };
 
@@ -82,6 +96,7 @@ const DEFAULTS: Settings = {
   words: 25,
   effect: 'fall',
   speed: '1',
+  advance: 'space',
   sound: false,
 };
 
@@ -98,6 +113,7 @@ export function loadSettings(): Settings {
     if (!WORD_OPTIONS.includes(s.words)) s.words = DEFAULTS.words;
     if (!EFFECT_OPTIONS.includes(s.effect)) s.effect = DEFAULTS.effect;
     if (!SPEED_OPTIONS.includes(s.speed)) s.speed = DEFAULTS.speed;
+    if (!ADVANCE_OPTIONS.includes(s.advance)) s.advance = DEFAULTS.advance;
     s.sound = !!s.sound;
     return s;
   } catch {

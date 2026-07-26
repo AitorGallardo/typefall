@@ -4,6 +4,7 @@ import {
   type ViewId,
   type EffectId,
   type SpeedId,
+  type AdvanceId,
   TIME_OPTIONS,
   WORD_OPTIONS,
   VIEW_OPTIONS,
@@ -12,6 +13,8 @@ import {
   EFFECT_LABELS,
   SPEED_OPTIONS,
   SPEED_LABELS,
+  ADVANCE_OPTIONS,
+  ADVANCE_LABELS,
 } from './settings';
 
 export interface ResultStats {
@@ -39,7 +42,7 @@ export interface UICallbacks {
 
 // Builds and owns all DOM chrome: the live HUD, the gear button, the results
 // overlay and the settings/menu panel. Same visual language as the scene:
-// dark, mono, one green accent, no gamey colour.
+// dark, mono, one warm-gold accent, no gamey colour.
 export function createUI(cb: UICallbacks) {
   const root = document.createElement('div');
   root.id = 'ui';
@@ -51,7 +54,7 @@ export function createUI(cb: UICallbacks) {
   const hudProgress = el('span', 'hud-progress');
   const sep1 = el('span', 'hud-sep');
   sep1.textContent = '·';
-  const hudWpm = el('span', 'hud-metric');
+  const hudWpm = el('span', 'hud-metric hud-wpm');
   const sep2 = el('span', 'hud-sep');
   sep2.textContent = '·';
   const hudAcc = el('span', 'hud-metric');
@@ -121,13 +124,19 @@ export function createUI(cb: UICallbacks) {
     );
     panel.appendChild(wrapRow('view', viewBtns));
 
-    // speed (crawl only — the climb rate / auto rubber-band)
+    // speed (star wars only — the climb rate / auto rubber-band)
     if (s.view === 'crawl') {
       const speedBtns = SPEED_OPTIONS.map((sp: SpeedId) =>
         opt(SPEED_LABELS[sp], s.speed === sp ? 'sel' : '', () => cb.applySettings({ speed: sp })),
       );
       panel.appendChild(wrapRow('speed', speedBtns));
     }
+
+    // advance — space (deliberate, default) vs auto (on last correct letter)
+    const advanceBtns = ADVANCE_OPTIONS.map((a: AdvanceId) =>
+      opt(ADVANCE_LABELS[a], s.advance === a ? 'sel' : '', () => cb.applySettings({ advance: a })),
+    );
+    panel.appendChild(wrapRow('advance', advanceBtns));
 
     // mode
     const modeBtns = (['time', 'words', 'zen'] as ModeId[]).map((m) =>
