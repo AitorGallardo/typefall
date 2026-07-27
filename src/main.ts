@@ -5,9 +5,11 @@ import { TextGeometry } from 'three/addons/geometries/TextGeometry.js';
 import { Text as TroikaText, preloadFont } from 'troika-three-text';
 import * as CANNON from 'cannon-es';
 import { buildSequence } from './words';
+import { buildPhraseSequence, PHRASES } from './phrases';
 import { loadSettings, saveSettings, type Settings, type EffectId } from './settings';
 import { EffectSystem } from './effects';
-import { createUI } from './ui';
+import { Backdrop } from './backdrop';
+import { createUI, type ResultStats } from './ui';
 import { ResultsPanel, paintElementToCtx } from './resultsPanel';
 import { detectHtmlInCanvas } from './htmlCanvas';
 
@@ -160,12 +162,25 @@ const CRAWL_AUTO_TAU = 1.5; // controller smoothing time constant (s)
 
 const isTouch = matchMedia('(hover: none) and (pointer: coarse)').matches;
 
+// --- rush mode ---
+const RUSH_START = 15; // seconds on the clock at the first keystroke
+const RUSH_ADD = 1.2; // seconds added per completed word
+const RUSH_MAX = 30; // clock cap
+// --- loss-sequence timing ---
+const HYPER_DUR = 0.82; // hyperspace jump length before the crawl lose card (s)
+const SUDDEN_DUR = 0.26; // red-flinch length before the sudden-death lose card (s)
+
 // ---------------------------------------------------------------------------
 // Renderer / scene / camera
 // ---------------------------------------------------------------------------
 const canvas = document.getElementById('scene') as HTMLCanvasElement;
-const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: true });
+// alpha:true + a fully transparent clear so the DOM/SVG backdrop layers (the SVG
+// starfield in crawl, the dust/haze in the other views) show through behind the
+// scene. The body background (#0a0a0a === BG) provides the same base colour the
+// old opaque clear did, so paragraph/stream look identical.
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true, preserveDrawingBuffer: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setClearColor(0x000000, 0);
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -173,7 +188,10 @@ renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.15;
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(BG);
+// No scene background: the canvas clears transparent so the backdrop layers read
+// through. Fog still resolves toward BG (the body colour), so distant geometry
+// fades to the same dark it always did.
+scene.background = null;
 scene.fog = new THREE.Fog(BG, 26, 62);
 
 const camera = new THREE.PerspectiveCamera(STREAM_FOV, window.innerWidth / window.innerHeight, 0.1, 200);
@@ -623,6 +641,7 @@ interface View {
   interLetterGap(): number; // unscaled gap between glyphs, for the inter-letter caret
   caretDims(): { w: number; h: number; cy?: number }; // caret bar world size (+ optional word-local y offset off the baseline)
   update(dt: number): void; // per-frame layout easing
+  streakAway?(p: number): void; // crawl only: drive the hyperspace-loss zoom (p 0→1)
   relayout(): void; // recompute layout for a new viewport (keeps progress)
   dispose(): void;
   readonly camBase: THREE.Vector3;
@@ -656,7 +675,12 @@ let currentSpeed = CRAWL_BASE_LPS;
 let wpmSamples: number[] = [];
 
 function ensureSeq(n: number) {
-  while (seq.length < n) seq.push(...buildSequence(60));
+  while (seq.length < n) {
+    // Keep extending from the same corpus the run started with, so a long
+    // survival run never suddenly switches from phrases to random words.
+    if (settings.view === 'crawl') seq.push(...buildPhraseSequence(80));
+    else seq.push(...buildSequence(60));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1232,33 +1256,6 @@ function crawlMetrics(): CrawlMetrics {
   };
 }
 
-function makeStarfield(): THREE.Points {
-  // Very sparse, dim points parked behind the plane. Tiny, no additive blending,
-  // no glow — restrained backdrop, drifted slowly for a parallax whisper.
-  const n = isTouch ? 160 : 320;
-  const pos = new Float32Array(n * 3);
-  for (let i = 0; i < n; i++) {
-    pos[i * 3] = (Math.random() - 0.5) * 140;
-    pos[i * 3 + 1] = -8 + Math.random() * 70;
-    pos[i * 3 + 2] = -30 - Math.random() * 120;
-  }
-  const geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-  const mat = new THREE.PointsMaterial({
-    color: 0x9a9184, // a barely-warm gold hint, not the old cool blue-gray
-    size: 0.16,
-    sizeAttenuation: true,
-    transparent: true,
-    opacity: 0.5,
-    depthWrite: false,
-    fog: false,
-  });
-  const pts = new THREE.Points(geo, mat);
-  pts.frustumCulled = false;
-  pts.renderOrder = -1;
-  return pts;
-}
-
 function makeCrawlView(): View {
   interface CrawlWord {
     seqIndex: number;
@@ -1279,8 +1276,8 @@ function makeCrawlView(): View {
   root.rotation.x = -CRAWL_TILT; // tilt the plane back so it vanishes upward
   root.position.y = m.lift; // seat the reading band higher on screen (see crawlMetrics)
   scene.add(root);
-  const stars = makeStarfield();
-  scene.add(stars);
+  // The starfield is now a DOM/SVG backdrop layer (see backdrop.ts), so the crawl
+  // view no longer owns any 3D points.
 
   let lines: CrawlLine[] = [];
   let scroll = 0; // continuous climb progress, in line-heights
@@ -1435,15 +1432,11 @@ function makeCrawlView(): View {
       if (state.phase === 'running') scroll += currentSpeed * dt;
       ensureLinesForScroll();
 
-      // Auto-miss every active word whose line has climbed past the miss line.
-      // A whole line crosses at once, so this may retire several words in a frame
-      // (the remaining untyped words on that line) — the identity dissolve moment.
-      let guard = 0;
-      while (state.phase === 'running') {
+      // Survival: the instant the active word's line reaches the miss zone the
+      // run is over — no miss-and-continue. One crossing ends it.
+      if (state.phase === 'running') {
         const ly = activeLineLineH();
-        if (ly === null || ly < CRAWL_MISS_LINEH) break;
-        missActiveWord();
-        if (++guard > 400) break;
+        if (ly !== null && ly >= CRAWL_MISS_LINEH) loseSurvival();
       }
 
       for (let i = lines.length - 1; i >= 0; i--) {
@@ -1458,10 +1451,13 @@ function makeCrawlView(): View {
           lines.splice(i, 1);
         }
       }
-
-      // Restrained starfield parallax — a slow rotational drift, nothing showy.
-      stars.rotation.y += dt * 0.006;
-      stars.position.x = Math.sin(animClock * 0.05) * 1.5;
+    },
+    // Hyperspace loss: the tilted plane swells and rushes toward/past the camera
+    // as the SVG stars streak. Frame-clock driven (p: 0→1 over the jump).
+    streakAway(p: number) {
+      const e = p * p; // ease-in
+      root.position.z = e * 24;
+      root.scale.setScalar(1 + e * 1.5);
     },
     relayout() {
       rebuild(); // re-fit the tilted column to the new viewport (keeps progress)
@@ -1473,9 +1469,6 @@ function makeCrawlView(): View {
       }
       lines = [];
       root.removeFromParent();
-      stars.removeFromParent();
-      stars.geometry.dispose();
-      (stars.material as THREE.Material).dispose();
     },
     info() {
       root.updateWorldMatrix(true, false);
@@ -1513,6 +1506,34 @@ const state = {
   elapsed: 0, // seconds accumulated while running — frame-driven so the debug
   // handle can run deterministically (see update()).
 };
+
+// Rush clock (seconds remaining) + the loss-sequence timer/flag. `losing` gates
+// the short window between a loss firing and its lose card appearing, during
+// which the hyperspace / red-flinch animation plays.
+let rushClock = 0;
+let losing = false;
+let loseTimer = 0;
+
+// What the current run actually is. The crawl view is always survival regardless
+// of the (hidden) mode setting; every other view runs the chosen mode.
+type RunKind = 'time' | 'words' | 'zen' | 'rush' | 'sudden' | 'survival';
+function runKind(): RunKind {
+  if (settings.view === 'crawl') return 'survival';
+  return settings.mode as Exclude<RunKind, 'survival'>;
+}
+// Stream never needs a deliberate space — it always auto-advances on the last
+// correct letter. Crawl + paragraph honour the advance setting.
+function effectiveAdvance(): 'space' | 'auto' {
+  return settings.view === 'stream' ? 'auto' : settings.advance;
+}
+// The metric a config chases: survival / rush / sudden are scored by words
+// survived; time / words by wpm; zen keeps no score.
+function pbMetric(): 'wpm' | 'words' | null {
+  const k = runKind();
+  if (k === 'survival' || k === 'rush' || k === 'sudden') return 'words';
+  if (k === 'zen') return null;
+  return 'wpm';
+}
 // ---------------------------------------------------------------------------
 // Personal bests + history, keyed per config (mode + amount + view) so each
 // setup chases its own highscore — the monkeytype dopamine loop.
@@ -1521,16 +1542,28 @@ interface ScoreRecord {
   wpm: number;
   acc: number;
   raw: number;
+  words?: number; // words survived — the headline metric for survival/rush/sudden
   date: number;
 }
 const PB_PREFIX = 'typefall.pb.v1:';
 const HIST_PREFIX = 'typefall.hist.v1:';
 
+// The value a record scores under the current config's metric.
+function scoreOf(rec: ScoreRecord): number {
+  return pbMetric() === 'words' ? rec.words ?? 0 : rec.wpm;
+}
+
+// Per-config PB keys. Survival is a fresh family: the game changed from a
+// wpm-chase to a words-survived chase, so the old wpm-based crawl bests aren't
+// comparable and are intentionally left behind under their old keys. Survival
+// keeps one best per speed (`survival:∞:crawl:<speed>`); rush and sudden death
+// each keep one best per view (`rush:∞:<view>`, `sudden:∞:<view>`); time / words
+// keep the original `<mode>:<amount>:<view>` shape.
 function configKey(): string {
+  if (settings.view === 'crawl') return `survival:∞:crawl:${settings.speed}`;
+  if (settings.mode === 'rush') return `rush:∞:${settings.view}`;
+  if (settings.mode === 'sudden') return `sudden:∞:${settings.view}`;
   const amount = settings.mode === 'time' ? settings.time : settings.mode === 'words' ? settings.words : 0;
-  // Crawl chases its own best per speed setting — a 2.5x run and an auto run are
-  // different challenges, so each keeps a separate highscore.
-  if (settings.view === 'crawl') return `${settings.mode}:${amount}:crawl:${settings.speed}`;
   return `${settings.mode}:${amount}:${settings.view}`;
 }
 function loadPb(key: string): ScoreRecord | null {
@@ -1610,6 +1643,8 @@ function beginIfNeeded() {
   if (state.phase === 'ready') {
     state.phase = 'running';
     state.elapsed = 0;
+    if (runKind() === 'rush') rushClock = RUSH_START;
+    ui.hidePrompt();
   }
 }
 
@@ -1639,12 +1674,13 @@ function handleChar(ch: string) {
     return;
   }
 
-  beginIfNeeded();
-
   if (ch.toLowerCase() === pending.ch.toLowerCase()) {
-    // Correct: a clone peels off and blows away with the chosen effect while the
-    // surface glyph fades out of its (reserved) slot — Typefall's signature,
-    // without reflow. setGone (via paint) drives the fade.
+    // Correct: in crawl (survival) the FIRST correct key is what starts the
+    // motion and the clock — a wrong key at rest never wakes the crawl.
+    beginIfNeeded();
+    // A clone peels off and blows away with the chosen effect while the surface
+    // glyph fades out of its (reserved) slot — Typefall's signature, without
+    // reflow. setGone (via paint) drives the fade.
     detachClone(pending, settings.effect);
     pending.state = 'correct';
     setGone(pending);
@@ -1653,12 +1689,15 @@ function handleChar(ch: string) {
     wpmSamples.push(animClock); // feed the star-wars auto-speed rolling window
     letterIdx++;
     // In 'auto' advance the word jumps to the next the instant its last letter
-    // lands correct; in 'space' (default) it waits for a deliberate space.
-    if (settings.advance === 'auto' && letterIdx >= w.letters.length && allCurrentCorrect()) completeWord();
+    // lands correct; in 'space' (default) it waits for a deliberate space. Stream
+    // always auto-advances (see effectiveAdvance).
+    if (effectiveAdvance() === 'auto' && letterIdx >= w.letters.length && allCurrentCorrect()) completeWord();
     else activeView.paint();
   } else {
     // Wrong: the letter turns red and the caret advances (monkeytype default);
-    // the word won't complete until the mistake is backspaced and corrected.
+    // the word won't complete until the mistake is backspaced and corrected. In
+    // crawl the clock doesn't start on a wrong key (survival begins on a hit).
+    if (settings.view !== 'crawl') beginIfNeeded();
     pending.state = 'incorrect';
     setIncorrect(pending);
     letterStates[letterIdx] = 'incorrect';
@@ -1666,6 +1705,9 @@ function handleChar(ch: string) {
     letterIdx++;
     if (!activeView.lockCamera) addShake(0.32);
     activeView.paint();
+    // Sudden death: one wrong keystroke ends the run. The red letter is left
+    // showing for the flinch, then the lose card fades in.
+    if (runKind() === 'sudden') endRun('sudden');
   }
 }
 
@@ -1725,6 +1767,7 @@ function handleSpace() {
   const w = activeView.currentWord();
   if (!w) return;
   beginIfNeeded();
+  const hadSkip = letterIdx < w.letters.length;
   for (let i = letterIdx; i < w.letters.length; i++) {
     const l = w.letters[i];
     l.state = 'skipped';
@@ -1732,6 +1775,13 @@ function handleSpace() {
     state.incorrect++;
   }
   letterIdx = w.letters.length;
+  // Sudden death: skipping letters is an error, so it ends the run just like a
+  // wrong key. A clean, fully-correct space still advances normally.
+  if (runKind() === 'sudden' && hadSkip) {
+    activeView.paint();
+    endRun('sudden');
+    return;
+  }
   completeWord();
 }
 
@@ -1745,10 +1795,13 @@ function completeWord() {
 function advanceWord(creditSpace: boolean) {
   if (creditSpace) state.correct++;
   state.wordsDone++;
+  // Rush: each completed word tops the clock up (capped). Only a real finish
+  // earns it (creditSpace) — a miss never does.
+  if (creditSpace && runKind() === 'rush') rushClock = Math.min(RUSH_MAX, rushClock + RUSH_ADD);
   wordHistory[wordIndex] = letterStates.slice(); // remember for backspace-into-previous
   letterStates = [];
-  if (settings.mode === 'words' && state.wordsDone >= settings.words) {
-    finish();
+  if (runKind() === 'words' && state.wordsDone >= settings.words) {
+    endRun('complete');
     return;
   }
   wordIndex++;
@@ -1756,58 +1809,8 @@ function advanceWord(creditSpace: boolean) {
   activeView.advance();
 }
 
-// Crawl: the active word's line has crossed the miss line. Mark the untyped
-// remainder as skipped errors (each costs a keystroke, exactly like a space-skip),
-// count the word as missed, fire a low-intensity dissolve on each lost letter,
-// then advance the passage. Called in a loop so a whole line's worth of unfinished
-// words retire together as the line crosses.
-function missActiveWord() {
-  const w = activeView.currentWord();
-  if (!w) return;
-  const hadUntyped = letterIdx < w.letters.length;
-  for (let i = letterIdx; i < w.letters.length; i++) {
-    const l = w.letters[i];
-    l.state = 'skipped';
-    letterStates[i] = 'skipped';
-    state.incorrect++;
-    spawnDissolve(l);
-  }
-  letterIdx = w.letters.length;
-  if (hadUntyped) state.missed++;
-  advanceWord(false);
-}
-
-// A subtle disintegrate on a missed glyph — the same effect the passage sheds on
-// correct keys, at low intensity and red, so a missed word visibly crumbles away
-// rather than just recolouring. The original letter stays (it recedes and fades
-// with the climbing line); this is a peeled clone at the glyph's exact transform.
-function spawnDissolve(l: LayoutLetter) {
-  const src = l.object3d;
-  src.updateWorldMatrix(true, false);
-  const wp = new THREE.Vector3();
-  const wq = new THREE.Quaternion();
-  const ws = new THREE.Vector3();
-  src.matrixWorld.decompose(wp, wq, ws);
-  const s = l.cloneScale ?? ws.x;
-  const glyph = getGlyph(l.ch);
-  const mat = new THREE.MeshStandardMaterial({
-    color: RED,
-    roughness: 0.6,
-    metalness: 0.02,
-    emissive: RED,
-    emissiveIntensity: 0.14,
-    transparent: true,
-    opacity: 1,
-  });
-  const clone = new THREE.Mesh(glyph.geo, mat);
-  clone.position.copy(wp);
-  clone.position.z += 0.3;
-  clone.quaternion.copy(wq);
-  clone.scale.setScalar(s);
-  scene.add(clone);
-  const half = new CANNON.Vec3(glyph.half.x * s, glyph.half.y * s, glyph.half.z * s);
-  effects.play('disintegrate', clone, { color: new THREE.Color(RED), half }, 0.4);
-}
+// (Survival replaced miss-and-continue: a crawl word reaching the miss zone now
+// ends the run outright via loseSurvival, so there is no per-word miss dissolve.)
 
 // --- crawl speed controller ------------------------------------------------
 // Rolling WPM over a 10s window (frame-clock based, so the automation tab's
@@ -1847,7 +1850,10 @@ function addShake(mag: number) {
 // Test lifecycle
 // ---------------------------------------------------------------------------
 function newSequence() {
-  if (settings.mode === 'words') seq = buildSequence(settings.words);
+  // Crawl (survival) types Star-Wars-flavored phrase lines; the other views use
+  // the random English pool. Words mode packs exactly the requested count.
+  if (settings.view === 'crawl') seq = buildPhraseSequence(160);
+  else if (settings.mode === 'words') seq = buildSequence(settings.words);
   else seq = buildSequence(120);
 }
 
@@ -1859,6 +1865,7 @@ function buildView() {
       : settings.view === 'crawl'
         ? makeCrawlView()
         : makeParagraphView();
+  backdrop.setView(settings.view); // show the matching DOM/SVG backdrop layer
   caretSnap = true; // don't fly the caret in from its old position on rebuild
   camBase.copy(activeView.camBase);
   camLook.copy(activeView.camLook);
@@ -1874,9 +1881,13 @@ function restart() {
   state.wordsDone = 0;
   state.missed = 0;
   state.elapsed = 0;
+  rushClock = 0;
+  losing = false;
+  loseTimer = 0;
   effects.reset();
   resultsPanel.hide();
   shake.set(0, 0, 0);
+  canvas.classList.remove('hyper'); // clear any hyperspace-loss fade
   ui.hideResults();
   ui.closeMenu();
   ui.setHudVisible(true);
@@ -1890,37 +1901,122 @@ function restart() {
   newSequence();
   buildView();
   updateHud();
+  // Crawl is frozen at rest awaiting the first keystroke — a quiet gold prompt
+  // invites it; every other view starts on any key with no prompt.
+  if (settings.view === 'crawl') ui.showPrompt('type to begin');
+  else ui.hidePrompt();
   if (isTouch) capture.focus({ preventScroll: true });
 }
 
-function finish() {
+type EndKind = 'complete' | 'survival' | 'rush' | 'sudden';
+
+// The stats + PB bookkeeping for the finished run, held between the loss
+// animation firing and its card appearing. Also surfaced through lastResult.
+let pendingStats: ResultStats | null = null;
+
+// Crawl survival loss — the active word's line reached the miss zone.
+function loseSurvival() {
+  endRun('survival');
+}
+
+// End the run. Scoring happens now (so the snapshot/PB reflect it immediately);
+// the lose card is deferred by the kind's animation so the effect plays first.
+function endRun(kind: EndKind) {
+  if (state.phase === 'finished') return;
   state.phase = 'finished';
+  ui.setHudVisible(false);
+  ui.hidePrompt();
+  pendingStats = buildStats(kind);
+
+  if (kind === 'survival') {
+    // Hyperspace jump: SVG stars streak (CSS), the scene rushes + fades (canvas
+    // CSS), the tilted plane swells toward the camera (frame-clock, see the crawl
+    // view's streakAway), and one tiny tremor fires.
+    backdrop.hyperspace();
+    canvas.classList.add('hyper');
+    addShake(0.1); // one 2–3px tremor, no more
+    losing = true;
+    loseTimer = HYPER_DUR;
+  } else if (kind === 'sudden') {
+    ui.flashRed();
+    losing = true;
+    loseTimer = SUDDEN_DUR;
+  } else {
+    presentResults(); // time / words complete, rush timeout → card immediately
+  }
+}
+
+// Build the results/lose card for a finished run and record the PB. The headline
+// metric follows the config: survival/rush/sudden read in words survived, the
+// classic modes in wpm.
+function buildStats(kind: EndKind): ResultStats {
   const wpm = liveWpm();
+  const words = state.wordsDone;
+  const metric = pbMetric(); // 'words' | 'wpm' | null (zen never reaches here)
+  const headline = metric === 'words' ? words : wpm;
 
   const key = configKey();
   const prev = loadPb(key);
-  const prevPb = prev ? prev.wpm : null;
-  const isNewPb = prevPb == null || wpm > prevPb;
-  const rec: ScoreRecord = { wpm, acc: accuracy(), raw: rawWpm(), date: Date.now() };
+  const prevScore = prev ? scoreOf(prev) : null;
+  // New best on a strictly higher score, or an equal words score broken by a
+  // higher wpm (survival/rush/sudden tiebreak).
+  const isNewPb =
+    prevScore == null ||
+    headline > prevScore ||
+    (metric === 'words' && headline === prevScore && prev != null && wpm > prev.wpm);
+  const rec: ScoreRecord = { wpm, acc: accuracy(), raw: rawWpm(), words, date: Date.now() };
   if (isNewPb) savePb(key, rec);
   const history = pushHistory(key, rec);
-  const deltaPb = isNewPb && prevPb != null ? wpm - prevPb : null;
-  lastResult = { key, wpm, pb: isNewPb ? wpm : prevPb, prevPb, isNewPb, historyLen: history.length };
+  const deltaPb = isNewPb && prevScore != null ? headline - prevScore : null;
+  lastResult = { key, wpm: headline, pb: isNewPb ? headline : prevScore, prevPb: prevScore, isNewPb, historyLen: history.length };
 
-  ui.setHudVisible(false);
-  ui.showResults({
+  const t = elapsedSec();
+  let title: string | undefined;
+  let headlineLabel = 'wpm';
+  let cells: [string, string][] | undefined;
+  let hint: string | undefined;
+  if (kind === 'survival') {
+    title = 'lost to hyperspace';
+    headlineLabel = 'survived';
+    cells = [['wpm', String(wpm)], ['acc', accuracy() + '%'], ['time', `${t.toFixed(1)}s`]];
+    hint = 'enter — run it again · or tap';
+  } else if (kind === 'rush') {
+    title = "time's up";
+    headlineLabel = 'words';
+    cells = [['wpm', String(wpm)], ['acc', accuracy() + '%'], ['lasted', `${t.toFixed(1)}s`]];
+    hint = 'enter — run it again · or tap';
+  } else if (kind === 'sudden') {
+    title = 'sudden death';
+    headlineLabel = 'words';
+    cells = [['wpm', String(wpm)], ['acc', accuracy() + '%'], ['chars', `${state.correct}/${state.incorrect}`]];
+    hint = 'enter — run it again · or tap';
+  }
+
+  return {
     wpm,
     acc: accuracy(),
     raw: rawWpm(),
     correct: state.correct,
     incorrect: state.incorrect,
-    timeSec: elapsedSec(),
-    missed: settings.view === 'crawl' ? state.missed : null,
-    pb: prevPb,
+    timeSec: t,
+    missed: null,
+    pb: prevScore,
     isNewPb,
     deltaPb,
     history: history.map((h) => ({ wpm: h.wpm, acc: h.acc })),
-  });
+    headline,
+    headlineLabel,
+    title,
+    cells,
+    hint,
+  };
+}
+
+// Reveal the deferred lose/results card and fire the panel + result rain.
+function presentResults() {
+  if (!pendingStats) return;
+  const st = pendingStats;
+  ui.showResults(st);
   // Try the html-in-canvas panel: where drawElement exists it paints the live
   // overlay onto a floating 3D card and the DOM overlay drops to invisible-but-
   // interactive; where it doesn't, the DOM overlay is unchanged. Either way the
@@ -1928,7 +2024,7 @@ function finish() {
   const paneled = resultsPanel.tryShow();
   ui.getResultsElement().classList.toggle('panel-mirrored', paneled);
   ui.setPanelLabel(resultsPanel.label);
-  rainResultLetters(isNewPb);
+  rainResultLetters(st.isNewPb);
 }
 
 // Let a few letters rain behind the results — small and dim so the stats read
@@ -1980,6 +2076,11 @@ const ui = createUI({
 // The floating html-in-canvas results panel (progressive enhancement). Where the
 // API is absent it stays dormant and the ordinary DOM overlay is shown.
 const resultsPanel = new ResultsPanel(scene, ui.getResultsElement());
+
+// DOM/SVG backdrop layers behind the transparent canvas: the SVG starfield
+// (crawl), the paragraph dust + vignette, the stream haze. Also owns the
+// hyperspace-jump loss animation.
+const backdrop = new Backdrop(document.body, isTouch);
 
 // ---------------------------------------------------------------------------
 // Keyboard + mobile input
@@ -2174,11 +2275,31 @@ function update(dt: number) {
   if (state.phase === 'running') state.elapsed += dt;
   animClock += dt;
 
+  // Rush clock: it drains while running and ends the run at zero.
+  if (state.phase === 'running' && runKind() === 'rush') {
+    rushClock = Math.max(0, rushClock - dt);
+    if (rushClock <= 0) endRun('rush');
+  }
+
   // Crawl climb rate (fixed multiplier, or the auto WPM rubber-band) is resolved
   // before the view scrolls so the miss line always reflects this frame's pace.
   if (settings.view === 'crawl') updateCrawlSpeed(dt);
 
   activeView.update(dt);
+
+  // Loss animation window: play the in-scene hyperspace zoom, then reveal the
+  // deferred lose card once the effect has run.
+  if (losing) {
+    loseTimer -= dt;
+    if (settings.view === 'crawl') {
+      const p = THREE.MathUtils.clamp(1 - loseTimer / HYPER_DUR, 0, 1);
+      activeView.streakAway?.(p);
+    }
+    if (loseTimer <= 0) {
+      losing = false;
+      presentResults();
+    }
+  }
 
   updateCaret(dt);
 
@@ -2191,9 +2312,9 @@ function update(dt: number) {
 
   effects.update(dt);
 
-  // Time-mode finish.
-  if (state.phase === 'running' && settings.mode === 'time' && elapsedSec() >= settings.time) {
-    finish();
+  // Time-mode finish (paragraph / stream only — crawl ignores the mode axis).
+  if (state.phase === 'running' && runKind() === 'time' && elapsedSec() >= settings.time) {
+    endRun('complete');
   }
 
   // Throttled HUD.
@@ -2207,20 +2328,37 @@ function update(dt: number) {
 function updateHud() {
   let modeLabel = '';
   let progress = '';
-  if (settings.mode === 'time') {
+  let extra = '';
+  let progressKind: 'normal' | 'clock' | 'clockUrgent' = 'normal';
+  const kind = runKind();
+  if (kind === 'survival') {
+    // Crawl is always survival — words survived is the whole score.
+    modeLabel = 'survival';
+    progress = String(state.wordsDone);
+    extra = 'survived';
+  } else if (kind === 'rush') {
+    // The clock is the star of the HUD: gold, and tenths under 5s.
+    modeLabel = 'rush';
+    const c = state.phase === 'ready' ? RUSH_START : rushClock;
+    progress = c < 5 ? c.toFixed(1) : String(Math.ceil(c));
+    progressKind = c < 5 && state.phase === 'running' ? 'clockUrgent' : 'clock';
+    extra = `${state.wordsDone} words`;
+  } else if (kind === 'sudden') {
+    modeLabel = 'sudden death';
+    progress = String(state.wordsDone);
+    extra = 'words';
+  } else if (kind === 'time') {
     modeLabel = 'time';
     const remain = Math.max(0, settings.time - elapsedSec());
     progress = state.phase === 'ready' ? String(settings.time) : String(Math.ceil(remain));
-  } else if (settings.mode === 'words') {
+  } else if (kind === 'words') {
     modeLabel = 'words';
     progress = `${state.wordsDone}/${settings.words}`;
   } else {
     modeLabel = 'zen';
     progress = String(state.wordsDone);
   }
-  // Crawl keeps the same one-liner but appends a missed counter.
-  const extra = settings.view === 'crawl' ? `${state.missed} missed` : '';
-  ui.setHud(modeLabel, progress, `${liveWpm()} wpm`, `${accuracy()}%`, state.phase === 'running', extra);
+  ui.setHud(modeLabel, progress, `${liveWpm()} wpm`, `${accuracy()}%`, state.phase === 'running', extra, progressKind);
 }
 
 function render() {
@@ -2295,10 +2433,26 @@ function snapshot() {
     missLineY: settings.view === 'crawl' ? ((activeView?.info().missLineY as number) ?? 0) : 0,
     panel: { supported: resultsPanel.support.supported, drawMethod: resultsPanel.support.drawMethod, label: resultsPanel.label },
     configKey: configKey(),
-    pb: loadPb(configKey())?.wpm ?? null,
+    pb: (() => {
+      const rec = loadPb(configKey());
+      return rec ? scoreOf(rec) : null;
+    })(),
+    // Survival / rush / sudden state, surfaced for deterministic verification.
+    kind: runKind(),
+    metric: pbMetric(),
+    rushClock: +rushClock.toFixed(3),
+    losing,
+    backdropView: settings.view,
+    // True when the crawl's active text is drawn from phrases.ts (all sampled
+    // words belong to the phrase vocabulary) — lets a test assert the corpus.
+    fromCorpus: settings.view === 'crawl' && seq.slice(0, 60).every((w) => PHRASE_WORDS.has(w)),
+    seqSample: seq.slice(0, 12),
     lastResult,
   };
 }
+// Flat vocabulary of every word across the phrase corpus, for the fromCorpus
+// assertion above.
+const PHRASE_WORDS = new Set(PHRASES.join(' ').split(' '));
 
 (window as unknown as { typefall: unknown }).typefall = {
   get scene() {

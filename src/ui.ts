@@ -9,6 +9,8 @@ import {
   WORD_OPTIONS,
   VIEW_OPTIONS,
   VIEW_LABELS,
+  MODE_OPTIONS,
+  MODE_LABELS,
   EFFECT_OPTIONS,
   EFFECT_LABELS,
   SPEED_OPTIONS,
@@ -25,10 +27,21 @@ export interface ResultStats {
   incorrect: number;
   timeSec: number;
   missed: number | null; // crawl: words that crossed the miss line untyped (null = hide)
-  pb: number | null; // previous best wpm for this config (null = none yet)
+  pb: number | null; // previous best (of the headline metric) for this config (null = none yet)
   isNewPb: boolean;
-  deltaPb: number | null; // wpm - previous best, when beaten and a prior best existed
+  deltaPb: number | null; // headline - previous best, when beaten and a prior best existed
   history: { wpm: number; acc: number }[]; // most-recent-first, up to 5
+  // Flexible headline: the big number + its label. Defaults to wpm. Survival /
+  // rush / sudden set this to words-survived so the score UI reads in the metric
+  // that setup actually chases.
+  headline?: number;
+  headlineLabel?: string;
+  // Optional restrained title above the score (e.g. "lost to hyperspace"). The
+  // pb line and the (optional) custom grid cells + restart hint round out the
+  // adapted lose card.
+  title?: string;
+  cells?: [string, string][];
+  hint?: string;
 }
 
 export interface UICallbacks {
@@ -75,10 +88,17 @@ export function createUI(cb: UICallbacks) {
   focusLost.appendChild(focusLine);
   focusLost.addEventListener('click', () => cb.onFocusRestore());
 
-  root.append(hud, gear, focusLost);
+  // --- "type to begin" prompt (crawl at rest) — quiet gold mono line --------
+  const prompt = el('div', 'prompt hidden');
+
+  // --- sudden-death red flinch — a quick full-screen red wash --------------
+  const redFlash = el('div', 'red-flash');
+
+  root.append(hud, gear, focusLost, prompt, redFlash);
 
   // --- results overlay --------------------------------------------------
   const results = el('div', 'overlay results hidden');
+  const rTitle = el('div', 'r-title hidden');
   const rWpm = el('div', 'r-wpm');
   const rWpmLabel = el('div', 'r-label');
   rWpmLabel.textContent = 'wpm';
@@ -86,10 +106,11 @@ export function createUI(cb: UICallbacks) {
   const rGrid = el('div', 'r-grid');
   const rHistory = el('div', 'r-history');
   const rHint = el('div', 'r-hint');
-  rHint.innerHTML = 'restart <span class="k">tab</span> + <span class="k">enter</span> · or click';
+  const DEFAULT_HINT = 'restart <span class="k">tab</span> + <span class="k">enter</span> · or click';
+  rHint.innerHTML = DEFAULT_HINT;
   // Small mono footer, results only: which render path the panel used.
   const rFooter = el('div', 'r-footer');
-  results.append(rWpm, rWpmLabel, rPb, rGrid, rHistory, rHint, rFooter);
+  results.append(rTitle, rWpm, rWpmLabel, rPb, rGrid, rHistory, rHint, rFooter);
   results.addEventListener('click', () => cb.restart());
 
   // --- settings / menu panel -------------------------------------------
@@ -132,29 +153,40 @@ export function createUI(cb: UICallbacks) {
       panel.appendChild(wrapRow('speed', speedBtns));
     }
 
-    // advance — space (deliberate, default) vs auto (on last correct letter)
-    const advanceBtns = ADVANCE_OPTIONS.map((a: AdvanceId) =>
-      opt(ADVANCE_LABELS[a], s.advance === a ? 'sel' : '', () => cb.applySettings({ advance: a })),
-    );
-    panel.appendChild(wrapRow('advance', advanceBtns));
-
-    // mode
-    const modeBtns = (['time', 'words', 'zen'] as ModeId[]).map((m) =>
-      opt(m, s.mode === m ? 'sel' : '', () => cb.applySettings({ mode: m })),
-    );
-    panel.appendChild(wrapRow('mode', modeBtns));
-
-    // amount (depends on mode)
-    if (s.mode !== 'zen') {
-      const values = s.mode === 'time' ? TIME_OPTIONS : WORD_OPTIONS;
-      const cur = s.mode === 'time' ? s.time : s.words;
-      const label = s.mode === 'time' ? 'seconds' : 'words';
-      const amountBtns = values.map((v) =>
-        opt(String(v), cur === v ? 'sel' : '', () =>
-          cb.applySettings(s.mode === 'time' ? { time: v } : { words: v }),
-        ),
+    // advance — space (deliberate, default) vs auto (on last correct letter).
+    // Stream always auto-advances (it never needs a space), so the control is
+    // shown disabled-as-n/a there; crawl + paragraph get the live picker.
+    if (s.view === 'stream') {
+      const na = el('span', 'p-na');
+      na.textContent = 'auto (n/a in stream)';
+      panel.appendChild(wrapRow('advance', [na]));
+    } else {
+      const advanceBtns = ADVANCE_OPTIONS.map((a: AdvanceId) =>
+        opt(ADVANCE_LABELS[a], s.advance === a ? 'sel' : '', () => cb.applySettings({ advance: a })),
       );
-      panel.appendChild(wrapRow(label, amountBtns));
+      panel.appendChild(wrapRow('advance', advanceBtns));
+    }
+
+    // mode — hidden in crawl (which is always survival). paragraph + stream get
+    // the full set (time/words/zen/rush/sudden death).
+    if (s.view !== 'crawl') {
+      const modeBtns = MODE_OPTIONS.map((m: ModeId) =>
+        opt(MODE_LABELS[m], s.mode === m ? 'sel' : '', () => cb.applySettings({ mode: m })),
+      );
+      panel.appendChild(wrapRow('mode', modeBtns));
+
+      // amount (only time / words carry an amount)
+      if (s.mode === 'time' || s.mode === 'words') {
+        const values = s.mode === 'time' ? TIME_OPTIONS : WORD_OPTIONS;
+        const cur = s.mode === 'time' ? s.time : s.words;
+        const label = s.mode === 'time' ? 'seconds' : 'words';
+        const amountBtns = values.map((v) =>
+          opt(String(v), cur === v ? 'sel' : '', () =>
+            cb.applySettings(s.mode === 'time' ? { time: v } : { words: v }),
+          ),
+        );
+        panel.appendChild(wrapRow(label, amountBtns));
+      }
     }
 
     // effect
@@ -256,7 +288,15 @@ export function createUI(cb: UICallbacks) {
     setPanelLabel(label: string) {
       rFooter.textContent = `panel: ${label}`;
     },
-    setHud(modeLabel: string, progress: string, wpm: string, acc: string, active: boolean, extra = '') {
+    setHud(
+      modeLabel: string,
+      progress: string,
+      wpm: string,
+      acc: string,
+      active: boolean,
+      extra = '',
+      progressKind: 'normal' | 'clock' | 'clockUrgent' = 'normal',
+    ) {
       hudMode.textContent = modeLabel;
       hudProgress.textContent = progress;
       hudWpm.textContent = wpm;
@@ -264,9 +304,25 @@ export function createUI(cb: UICallbacks) {
       hudExtra.textContent = extra;
       sep3.style.display = extra ? '' : 'none';
       hud.classList.toggle('active', active);
+      hudProgress.classList.toggle('clock', progressKind !== 'normal');
+      hudProgress.classList.toggle('urgent', progressKind === 'clockUrgent');
     },
     setHudVisible(v: boolean) {
       hud.style.opacity = v ? '' : '0';
+    },
+    showPrompt(text: string) {
+      prompt.textContent = text;
+      prompt.classList.remove('hidden');
+    },
+    hidePrompt() {
+      prompt.classList.add('hidden');
+    },
+    // Quick red flinch for sudden death, then it fades on its own.
+    flashRed() {
+      redFlash.classList.remove('run');
+      // force reflow so the animation restarts even on back-to-back deaths
+      void redFlash.offsetWidth;
+      redFlash.classList.add('run');
     },
     showFocusLost() {
       focusLost.classList.remove('hidden');
@@ -275,8 +331,18 @@ export function createUI(cb: UICallbacks) {
       focusLost.classList.add('hidden');
     },
     showResults(st: ResultStats) {
-      rWpm.textContent = String(st.wpm);
+      // Optional restrained title above the score (lose cards use it).
+      if (st.title) {
+        rTitle.textContent = st.title;
+        rTitle.classList.remove('hidden');
+      } else {
+        rTitle.classList.add('hidden');
+      }
+
+      const headline = st.headline ?? st.wpm;
+      rWpm.textContent = String(headline);
       rWpm.classList.toggle('pb', st.isNewPb);
+      rWpmLabel.textContent = st.headlineLabel ?? 'wpm';
 
       // The personal-best line: restrained normally, unmistakable when beaten.
       if (st.isNewPb) {
@@ -285,17 +351,17 @@ export function createUI(cb: UICallbacks) {
           st.deltaPb != null ? `new personal best  +${st.deltaPb}` : 'new personal best';
       } else {
         rPb.classList.remove('is-new');
-        rPb.textContent = st.pb != null ? `pb ${st.pb}` : 'no pb yet';
+        rPb.textContent = st.pb != null ? `best ${st.pb}` : 'no best yet';
       }
 
       rGrid.innerHTML = '';
-      const cells: [string, string][] = [
+      const cells: [string, string][] = st.cells ?? [
         ['acc', st.acc + '%'],
         ['raw', String(st.raw)],
         ['chars', `${st.correct}/${st.incorrect}`],
         ['time', `${st.timeSec.toFixed(1)}s`],
       ];
-      if (st.missed != null) cells.push(['missed', String(st.missed)]);
+      if (!st.cells && st.missed != null) cells.push(['missed', String(st.missed)]);
       for (const [k, v] of cells) {
         const cell = el('div', 'r-cell');
         const kk = el('div', 'r-k');
@@ -320,6 +386,8 @@ export function createUI(cb: UICallbacks) {
           rHistory.appendChild(row);
         }
       }
+
+      rHint.innerHTML = st.hint ?? DEFAULT_HINT;
 
       results.classList.remove('hidden');
     },
