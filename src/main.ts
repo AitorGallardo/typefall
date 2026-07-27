@@ -64,16 +64,20 @@ const OP_CURRENT = 1;
 const OP_UPCOMING = 0.6;
 const OP_COMPLETED = 0.42;
 
-// --- stream layout ---
-// Stream is the measured-flow engine (the same packing as paragraph) rendered
-// with the chunky extruded 3D glyphs instead of flat SDF text — "paragraph mode,
-// but chunky letters". Flat, upright rows on consistent baselines, uniform glyph
-// size (no depth scaling / receding), even word gaps, wrapped by real glyph
-// advances. Camera is static and dead-on so every letter faces it squarely.
-const STREAM_LINE_EM = 1.62; // line height (a touch taller than paragraph — the
-// extruded glyphs are bolder, so the extra leading keeps rows from ever touching)
-const STREAM_CENTER_BIAS = 0.06; // block lift above vertical center (fraction of view H)
-const STREAM_FONT_PX = 34; // target on-screen em height in CSS px (desktop)
+// --- stream layout — the fly-in presentation ---
+// Words approach the reader out of the dark, slot by slot: the active word rests
+// nearest and largest at slot 0, and the next few recede up-and-back, each smaller
+// and dimmer, so the passage reads as a column flying in from the background. The
+// perspective (position / scale / opacity by depth) lives on the WORD GROUP only —
+// every glyph inside a word is a rigid baseline-set unit at one uniform scale.
+const BASE_Y = 3.85; // world y of the active (front) word's baseline
+const Z_GAP = 5.4; // z spacing between successive slots (the depth of the fly-in)
+const Y_RISE = 0.42; // each receding slot lifts slightly so the column stays legible
+const SCALE_FALLOFF = 0.85; // per-slot uniform shrink toward the background
+const WINDOW = 7; // visible upcoming words, including the active one
+// Caret vertical center above the shared baseline, as a fraction of LETTER_SIZE —
+// lifts the bar off the baseline to sit centered on the glyph body (cap-height/2-ish).
+const CARET_BODY_CENTER = 0.34;
 
 // Floor sits well below the text so falling debris and shadows stay out of the
 // reading zone — background flavor, not clutter.
@@ -106,13 +110,12 @@ let MONO_ADVANCE = 0.6;
 
 // --- per-view cameras (fov chosen per view; paragraph is flat/near-orthographic
 // so rows stay parallel and letters keep a uniform size — the "tool" feel) ---
-// Stream shares the paragraph's dead-on framing (camera on the +z axis looking
-// straight down -z at the z=0 text plane) so rows stay parallel and every glyph
-// keeps one size — the only difference from paragraph is the glyph backend. The
-// fov is a touch wider than paragraph so the extruded depth still reads.
-const STREAM_CAM_BASE = new THREE.Vector3(0, 3.6, 26);
-const STREAM_CAM_LOOK = new THREE.Vector3(0, 3.6, 0);
-const STREAM_FOV = 34;
+// The stream camera sits low and close and looks slightly up the receding column,
+// so the active word fills the foreground and the upcoming words trail off into
+// the dark — the fly-in perspective. The wide fov exaggerates the depth.
+const STREAM_CAM_BASE = new THREE.Vector3(0, 5.6, 13.5);
+const STREAM_CAM_LOOK = new THREE.Vector3(0, 4.0, -4);
+const STREAM_FOV = 50;
 const PARA_CAM_BASE = new THREE.Vector3(0, 3.6, 30);
 const PARA_CAM_LOOK = new THREE.Vector3(0, 3.6, 0);
 const PARA_FOV = 28;
@@ -267,6 +270,12 @@ interface Glyph {
   geo: TextGeometry;
   half: CANNON.Vec3;
   width: number;
+  // Distance the geometry was shifted down to center it on its bbox — equivalently
+  // the y of the font BASELINE inside the centered geometry is -cy. A word that
+  // wants its glyphs sitting on a shared baseline lifts each mesh by its own cy
+  // (see createWord); clones keep the centered origin so their physics box wraps
+  // the visible glyph exactly as before.
+  cy: number;
 }
 const glyphCache = new Map<string, Glyph>();
 let font: Font | null = null;
@@ -300,7 +309,7 @@ function getGlyph(ch: string): Glyph {
     Math.max((bb.max.y - bb.min.y) / 2, 0.16),
     Math.max((bb.max.z - bb.min.z) / 2, 0.16),
   );
-  g = { geo, half, width: Math.max(w, 0.4) };
+  g = { geo, half, width: Math.max(w, 0.4), cy };
   glyphCache.set(ch, g);
   return g;
 }
@@ -402,8 +411,12 @@ interface LayoutLetter {
   dispose(): void;
 }
 
-// Build an extruded-3D word group (stream view) with its letters centred around
-// the group origin. Not added to any parent — the caller scales and places it.
+// Build an extruded-3D word group (stream view) as a RIGID, professionally-set
+// unit: every glyph shares one baseline (word-local y = 0), x steps by the real
+// glyph advance with a uniform tracking, and every letter takes the same scale —
+// no per-char size, rotation or jitter. The perspective (position/scale/opacity by
+// depth) is applied to the GROUP by the view, never to individual glyphs. Not added
+// to any parent — the caller scales and places it.
 function createWord(
   text: string,
   castShadow = true,
@@ -427,7 +440,12 @@ function createWord(
     const mesh = new THREE.Mesh(glyph.geo, mat);
     mesh.castShadow = castShadow;
     const localX = cursor + widths[i] / 2;
-    mesh.position.set(localX, 0, 0);
+    // BASELINE ALIGNMENT: the shared geometry is centered on its own bbox, so its
+    // baseline sits at geo-local y = -glyph.cy. Lifting the mesh by +glyph.cy puts
+    // that baseline back on the word's y = 0 for EVERY glyph — tall letters, x-height
+    // letters and descenders all rest on one line (descenders hang naturally below),
+    // instead of each floating on its own bbox center. This is the alignment fix.
+    mesh.position.set(localX, glyph.cy, 0);
     group.add(mesh);
     letters.push({
       ch,
@@ -603,7 +621,7 @@ interface View {
   retreat(): void; // step back to the previous word (backspace across a boundary)
   boundaryGap(): number; // unscaled gap past the last glyph, for the word-end caret
   interLetterGap(): number; // unscaled gap between glyphs, for the inter-letter caret
-  caretDims(): { w: number; h: number }; // caret bar world size for the active word
+  caretDims(): { w: number; h: number; cy?: number }; // caret bar world size (+ optional word-local y offset off the baseline)
   update(dt: number): void; // per-frame layout easing
   relayout(): void; // recompute layout for a new viewport (keeps progress)
   dispose(): void;
@@ -936,69 +954,156 @@ function makeFlowView(backend: FlowBackend): View {
   };
 }
 
-// Stream view metrics — the paragraph derivation, but for the dead-on stream
-// camera and with the extruded glyphs' bolder leading. The glyph is scaled to the
-// same on-screen em; wrapping uses the real (variable) extruded advances.
-function streamMetrics(): FlowMetrics {
-  const dist = STREAM_CAM_BASE.z; // camera looks straight down -z at the z=0 plane
-  const visH = 2 * dist * Math.tan(((STREAM_FOV * Math.PI) / 180) / 2);
-  const aspect = window.innerWidth / window.innerHeight;
-  const visW = visH * aspect;
-  const worldPerPx = visW / window.innerWidth;
-  const narrow = window.innerWidth < 640;
-  const fontPx = narrow ? 40 : STREAM_FONT_PX;
-  const colVw = narrow ? 0.94 : 0.84;
-  const em = fontPx * worldPerPx;
-  const colWidth = Math.min(colVw * visW, PARA_COL_MAX_PX * worldPerPx);
-  const lineH = STREAM_LINE_EM * em;
-  const centerY = STREAM_CAM_LOOK.y;
-  const topY = centerY + STREAM_CENTER_BIAS * visH + (lineH * (PARA_VISIBLE - 1)) / 2;
+// ---------------------------------------------------------------------------
+// Stream view — the fly-in presentation. Words approach the reader slot by slot
+// out of the dark: the active word rests nearest and largest at slot 0, and the
+// next few recede up-and-back, each smaller and dimmer, so the passage reads as a
+// column flying in from the background. The perspective motion (position / scale /
+// opacity by depth) lives entirely on the WORD GROUP; every glyph inside a word is
+// a rigid, baseline-set unit at one uniform scale (see createWord).
+// ---------------------------------------------------------------------------
+function makeStreamView(): View {
+  const tmpVec = new THREE.Vector3();
+  interface StreamWord {
+    group: THREE.Group;
+    letters: LayoutLetter[];
+    targetSlot: number;
+  }
+  let visible: StreamWord[] = [];
+
+  function slotPos(slot: number, out: THREE.Vector3): THREE.Vector3 {
+    return out.set(0, BASE_Y + slot * Y_RISE, -slot * Z_GAP);
+  }
+  function slotScale(slot: number): number {
+    return Math.pow(SCALE_FALLOFF, slot);
+  }
+  function slotOpacity(slot: number): number {
+    if (slot <= 0) return 1;
+    return THREE.MathUtils.clamp(0.5 * Math.pow(0.72, slot - 1), 0.1, 1);
+  }
+
+  function addWord(seqIdx: number, slot: number): StreamWord {
+    const { group, letters } = createWord(seq[seqIdx]);
+    slotPos(slot, group.position);
+    group.scale.setScalar(slotScale(slot));
+    scene.add(group);
+    return { group, letters, targetSlot: slot };
+  }
+
+  // Colour the front (active) word from its per-char state; further words stay
+  // muted gray (their createWord default) and are dimmed by the slot opacity.
+  function paint(): void {
+    const cur = visible[0];
+    if (!cur) return;
+    for (let i = 0; i < cur.letters.length; i++) {
+      const l = cur.letters[i];
+      if (i < letterIdx) letterStates[i] === 'correct' ? setGone(l) : setIncorrect(l);
+      else setCurrentUntyped(l);
+    }
+  }
+
+  // Build the initial window straight from wordIndex (0 on a fresh test).
+  const count = Math.min(WINDOW, seq.length);
+  for (let s = 0; s < count; s++) visible.push(addWord(wordIndex + s, s));
+  paint();
+
   return {
-    em,
-    advance: em * MONO_ADVANCE,
-    colHalf: colWidth / 2,
-    gap: PARA_GAP_EM * em,
-    lineH,
-    topY,
-    caretW: Math.max(0.03, 2.5 * worldPerPx), // ~2.5 CSS px — a touch heavier than paragraph
+    camBase: STREAM_CAM_BASE,
+    camLook: STREAM_CAM_LOOK,
+    camFov: STREAM_FOV,
+    lockCamera: false,
+    tiltX: 0,
+    currentWord() {
+      const cur = visible[0];
+      return cur ? { group: cur.group, letters: cur.letters } : null;
+    },
+    paint,
+    advance() {
+      const gone = visible.shift();
+      if (gone) disposeWord(gone.group, gone.letters);
+      // Slide everyone forward one slot.
+      for (let k = 0; k < visible.length; k++) visible[k].targetSlot = k;
+      // Bring in a new word at the back if the sequence has one.
+      const backSeqIdx = wordIndex + WINDOW - 1;
+      if (settings.mode !== 'words') ensureSeq(backSeqIdx + 2);
+      if (backSeqIdx < seq.length) {
+        const w = addWord(backSeqIdx, WINDOW);
+        w.targetSlot = visible.length;
+        visible.push(w);
+      }
+      paint();
+    },
+    // Backspace stepped across a word boundary: the just-completed word was
+    // disposed on advance, so rebuild it at the front slot (wordIndex has already
+    // been decremented) and drop the tail word to keep the window bounded.
+    retreat() {
+      if (visible.length >= WINDOW) {
+        const back = visible.pop();
+        if (back) disposeWord(back.group, back.letters);
+      }
+      const front = addWord(wordIndex, 0);
+      visible.unshift(front);
+      for (let k = 0; k < visible.length; k++) visible[k].targetSlot = k;
+      paint();
+    },
+    boundaryGap() {
+      return LETTER_SPACING;
+    },
+    interLetterGap() {
+      return LETTER_SPACING;
+    },
+    caretDims() {
+      // The active word rests at slot 0 (scale 1), so the extruded glyphs are
+      // LETTER_SIZE tall; a chunky-ish bar reads well against them. cy lifts the
+      // bar off the shared baseline (word-local y = 0) to sit centered on the body.
+      return { w: 0.09, h: LETTER_SIZE * 1.04, cy: LETTER_SIZE * CARET_BODY_CENTER };
+    },
+    update(dt: number) {
+      const lerp = 1 - Math.pow(0.0015, dt);
+      for (const w of visible) {
+        slotPos(w.targetSlot, tmpVec);
+        w.group.position.lerp(tmpVec, lerp);
+        const ts = slotScale(w.targetSlot);
+        w.group.scale.setScalar(THREE.MathUtils.lerp(w.group.scale.x, ts, lerp));
+        const op = slotOpacity(w.targetSlot);
+        for (const l of w.letters) applyLetterVis(l, dt, op);
+      }
+    },
+    relayout() {
+      /* stream slots are camera-relative — nothing to recompute on resize */
+    },
+    dispose() {
+      for (const w of visible) disposeWord(w.group, w.letters);
+      visible = [];
+    },
+    info() {
+      const cur = visible[0];
+      // Alignment proof: the world-space position and baseline y of every glyph in
+      // the active word. Each mesh sits at word-local (localX, glyph.cy); its world
+      // baseline is that world y minus glyph.cy·scale, which resolves to the group's
+      // y for EVERY glyph — so the baselines are identical by construction, and this
+      // export lets a test confirm it empirically (equal baselines, increasing x).
+      const active = cur
+        ? cur.letters.map((l) => {
+            const wp = new THREE.Vector3();
+            l.object3d.getWorldPosition(wp);
+            const s = cur.group.scale.x;
+            return {
+              ch: l.ch,
+              x: +wp.x.toFixed(4),
+              baseline: +(wp.y - getGlyph(l.ch).cy * s).toFixed(4),
+            };
+          })
+        : [];
+      return {
+        view: 'stream',
+        visible: visible.length,
+        groupY: cur ? +cur.group.position.y.toFixed(4) : 0,
+        active,
+      };
+    },
   };
 }
-
-// World width of an extruded word at the target em: the same sum createWord lays
-// out (glyph advances + inter-letter spacing), scaled from build size to em.
-function extrudedWordWidth(text: string, m: FlowMetrics): number {
-  let w = 0;
-  for (const c of text) w += getGlyph(c).width;
-  w += LETTER_SPACING * Math.max(0, text.length - 1);
-  return w * (m.em / LETTER_SIZE);
-}
-
-// The extruded (stream) backend: chunky 3D glyphs, dead-on camera, uniform size.
-const STREAM_BACKEND: FlowBackend = {
-  view: 'stream',
-  camBase: STREAM_CAM_BASE,
-  camLook: STREAM_CAM_LOOK,
-  camFov: STREAM_FOV,
-  metrics: streamMetrics,
-  wordWidth: extrudedWordWidth,
-  makeWord(text, m) {
-    const { group, letters } = createWord(text);
-    group.scale.setScalar(m.em / LETTER_SIZE); // uniform on-screen size, no receding
-    return { group, letters };
-  },
-  // The word group is scaled by em/LETTER_SIZE, so a local gap of
-  // PARA_GAP_EM*LETTER_SIZE maps to the world gap PARA_GAP_EM*em — matching the
-  // packing gap and keeping caret placement identical to paragraph in feel.
-  boundaryGapLocal() {
-    return PARA_GAP_EM * LETTER_SIZE;
-  },
-  interLetterGapLocal() {
-    return LETTER_SPACING; // extruded glyphs are laid out with this spacing baked in
-  },
-  caretH(m) {
-    return m.em * 1.05;
-  },
-};
 
 // ---------------------------------------------------------------------------
 // Paragraph view — the shared measured-flow engine with the flat SDF (troika)
@@ -1064,12 +1169,9 @@ const PARA_BACKEND: FlowBackend = {
   },
 };
 
-// The two flow views are the shared engine bound to their glyph backend.
+// The paragraph is the shared measured-flow engine bound to the flat SDF backend.
 function makeParagraphView(): View {
   return makeFlowView(PARA_BACKEND);
-}
-function makeStreamView(): View {
-  return makeFlowView(STREAM_BACKEND);
 }
 
 // ---------------------------------------------------------------------------
@@ -2003,6 +2105,7 @@ function updateCaret(dt: number) {
     caretState.visible = false;
     return;
   }
+  const dims = activeView.caretDims();
   const pending = cur.letters[letterIdx];
   let localX: number;
   if (pending) {
@@ -2020,7 +2123,9 @@ function updateCaret(dt: number) {
     // the paragraph, a slot gap in the stream), not the intra-word spacing.
     localX = last.localX + last.halfWidth + activeView.boundaryGap() * 0.5;
   }
-  cur.group.localToWorld(caretTarget.set(localX, 0, 0));
+  // cy lifts the bar off the shared baseline onto the glyph body (stream); the flat
+  // views anchor their glyphs on center, so cy is 0 and this is a no-op there.
+  cur.group.localToWorld(caretTarget.set(localX, dims.cy ?? 0, 0));
 
   // Snap on first appearance / view switch; otherwise fast ease-out toward the
   // target — this animates the caret between keystrokes and rides the line scroll.
@@ -2033,7 +2138,6 @@ function updateCaret(dt: number) {
   caret.visible = true;
 
   const pulse = caretPulse;
-  const dims = activeView.caretDims();
   caret.scale.set(dims.w * (1 + 0.9 * pulse), dims.h, 1);
   caret.rotation.set(activeView.tiltX, 0, 0); // match a tilted reading plane (crawl)
 
