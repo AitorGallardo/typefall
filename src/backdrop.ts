@@ -26,6 +26,9 @@ export class Backdrop {
   private stream: HTMLDivElement;
   private flash: HTMLDivElement;
   private starPts: { x: number; y: number }[] = [];
+  // Live streak elements for the hyperspace jump, each with its star's unit ray
+  // out from center and its distance to center — the geometry hyperStep drives.
+  private streakEls: { el: SVGLineElement; ux: number; uy: number; d: number; sw: number }[] = [];
   private view: BackdropView = 'crawl';
 
   constructor(host: HTMLElement = document.body, isTouch = false) {
@@ -162,45 +165,74 @@ export class Backdrop {
     this.stars.classList.remove('jump');
     this.root.classList.remove('flash');
     this.streaks.replaceChildren();
+    this.streakEls = [];
   }
 
   /**
-   * The hyperspace-jump loss animation (crawl only). Dots fade, each becomes a
-   * radial light-streak drawn out from the center past the viewer, the whole
-   * field rushes outward, and one faint gold flash fires. Pure CSS so it plays
-   * to completion regardless of the frame clock. ~820ms.
+   * Set up the hyperspace-jump loss animation (crawl only): a full-viewport star
+   * tunnel. Every star becomes a radial light-streak anchored at its OWN position
+   * and extending outward along the center→star ray — near-center stars are short
+   * bright dashes, edge stars run clear past the frame. The geometry is then
+   * driven per frame by hyperStep() (accelerating outward, ease-in), so it spans
+   * the whole viewport rather than clustering at center. The dot fade + gold flash
+   * stay CSS.
    */
   hyperspace(): void {
     if (this.view !== 'crawl') return;
     this.streaks.replaceChildren();
+    this.streakEls = [];
     const cx = 500;
     const cy = 500;
-    const maxDist = Math.hypot(500, 500);
     for (const p of this.starPts) {
       let dx = p.x - cx;
       let dy = p.y - cy;
-      let d = Math.hypot(dx, dy) || 0.001;
+      const d = Math.hypot(dx, dy) || 0.001;
       dx /= d;
       dy /= d;
-      // Line runs from the convergence point out through the star and well past
-      // the edge, so the drawn streak reads as light stretching past the viewer.
-      const far = 1500;
-      const x2 = cx + dx * far;
-      const y2 = cy + dy * far;
-      const len = far;
       const line = document.createElementNS(SVGNS, 'line');
       line.setAttribute('class', 'tf-streak');
-      line.setAttribute('x1', cx.toFixed(1));
-      line.setAttribute('y1', cy.toFixed(1));
-      line.setAttribute('x2', x2.toFixed(1));
-      line.setAttribute('y2', y2.toFixed(1));
-      // Stagger by distance: stars nearer the center streak a touch sooner.
-      const sd = ((d / maxDist) * 110).toFixed(0);
-      const sw = (0.8 + Math.random() * 2.2).toFixed(2);
-      line.setAttribute('style', `--len:${len};--sd:${sd}ms;--sw:${sw}`);
+      // Thicker streaks for stars farther out (they read as nearer/faster).
+      const sw = 0.6 + (d / 707) * 2.2 + Math.random() * 0.6;
+      line.setAttribute('style', `--sw:${sw.toFixed(2)}`);
       this.streaks.appendChild(line);
+      this.streakEls.push({ el: line, ux: dx, uy: dy, d, sw });
     }
     this.stars.classList.add('jump');
     this.root.classList.add('flash');
+    this.hyperStep(0);
+  }
+
+  /**
+   * Advance the star-tunnel geometry to progress p (0→1). Ease-in so the field
+   * accelerates outward. For a star at distance d along unit ray (ux,uy):
+   *   push   = ease·d·k1  — the star flies outward from center (field rushes past)
+   *   length = d·(k0 + ease·k2) — streak length grows with distance and over time
+   * The streak runs from the (pushed) inner point outward by `length`, so the
+   * leading (outer) end — the bright end of the gradient — races past the frame.
+   */
+  hyperStep(p: number): void {
+    if (this.streakEls.length === 0) return;
+    const cx = 500;
+    const cy = 500;
+    const t = Math.min(1, Math.max(0, p));
+    const ease = t * t; // ease-in: slow start, fast finish
+    const PUSH = 1.7; // how far the field flies outward by the end
+    const L0 = 0.18; // baseline length factor (so streaks read early)
+    const L2 = 1.8; // length growth factor (k reaches ~2 by the end)
+    // Opacity: rise quickly, hold, fade out over the last stretch.
+    const op = t < 0.82 ? Math.min(1, t * 6) * 0.92 : Math.max(0, (1 - t) / 0.18) * 0.92;
+    for (const s of this.streakEls) {
+      const push = ease * s.d * PUSH;
+      const len = s.d * (L0 + ease * L2);
+      const ir = s.d + push; // inner (trailing) radius
+      const or = ir + len; // outer (leading) radius
+      s.el.setAttribute('x1', (cx + s.ux * ir).toFixed(1));
+      s.el.setAttribute('y1', (cy + s.uy * ir).toFixed(1));
+      s.el.setAttribute('x2', (cx + s.ux * or).toFixed(1));
+      s.el.setAttribute('y2', (cy + s.uy * or).toFixed(1));
+      s.el.style.opacity = op.toFixed(3);
+      // Taper the stroke a touch as it stretches; brightest at full stretch.
+      s.el.style.strokeWidth = (s.sw * (1 - 0.35 * ease)).toFixed(2);
+    }
   }
 }

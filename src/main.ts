@@ -2293,7 +2293,8 @@ function update(dt: number) {
     loseTimer -= dt;
     if (settings.view === 'crawl') {
       const p = THREE.MathUtils.clamp(1 - loseTimer / HYPER_DUR, 0, 1);
-      activeView.streakAway?.(p);
+      activeView.streakAway?.(p); // in-scene: the tilted plane swells toward camera
+      backdrop.hyperStep(p); // in-SVG: drive the full-viewport star tunnel
     }
     if (loseTimer <= 0) {
       losing = false;
