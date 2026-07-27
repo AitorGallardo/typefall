@@ -1,7 +1,11 @@
 // Test settings, persisted to localStorage. Mirrors monkeytype's shape:
 // a mode, an amount for that mode, a completion effect, and an optional sound.
 
-export type ModeId = 'time' | 'words' | 'zen';
+// time/words/zen are the classic monkeytype-style modes; rush (a ticking clock
+// topped up by each word) and sudden (one mistake ends it) are the new pressure
+// modes. All apply to paragraph + stream. The crawl view ignores the mode axis
+// entirely — it is implicitly "survival" (see main.ts).
+export type ModeId = 'time' | 'words' | 'zen' | 'rush' | 'sudden';
 // The 'crawl' id is kept internally (localStorage + per-config PB keys) for
 // continuity; its user-facing label is "star wars" (see VIEW_LABELS).
 export type ViewId = 'crawl' | 'paragraph' | 'stream';
@@ -35,6 +39,17 @@ export interface Settings {
 
 export const TIME_OPTIONS = [15, 30, 60];
 export const WORD_OPTIONS = [10, 25, 50];
+
+// Mode picker order (paragraph + stream). Crawl hides this row — it is always
+// survival.
+export const MODE_OPTIONS: ModeId[] = ['time', 'words', 'zen', 'rush', 'sudden'];
+export const MODE_LABELS: Record<ModeId, string> = {
+  time: 'time',
+  words: 'words',
+  zen: 'zen',
+  rush: 'rush',
+  sudden: 'sudden death',
+};
 
 // crawl → a Star Wars opening crawl: the reading surface tilts back and the
 // lines climb continuously toward a horizon fade, typed as they travel;
@@ -100,15 +115,31 @@ const DEFAULTS: Settings = {
   sound: false,
 };
 
+// Device-aware defaults, applied ONLY when there is no saved config (fresh
+// localStorage). A saved config always wins. Desktop lands on the flagship
+// survival crawl at top speed; a phone (coarse pointer or a narrow viewport)
+// lands on the calmer stream, which auto-advances and never needs a soft-keyboard
+// space.
+function deviceDefaults(): Partial<Settings> {
+  try {
+    const coarse = matchMedia('(pointer: coarse)').matches;
+    const narrow = window.innerWidth < 700;
+    if (coarse || narrow) return { view: 'stream' };
+    return { view: 'crawl', speed: '2.5' };
+  } catch {
+    return {};
+  }
+}
+
 export function loadSettings(): Settings {
   try {
     const raw = localStorage.getItem(KEY);
-    if (!raw) return { ...DEFAULTS };
+    if (!raw) return { ...DEFAULTS, ...deviceDefaults() };
     const parsed = JSON.parse(raw) as Partial<Settings>;
     const s: Settings = { ...DEFAULTS, ...parsed };
     // Guard against tampered/stale values.
     if (!VIEW_OPTIONS.includes(s.view)) s.view = DEFAULTS.view;
-    if (!['time', 'words', 'zen'].includes(s.mode)) s.mode = DEFAULTS.mode;
+    if (!MODE_OPTIONS.includes(s.mode)) s.mode = DEFAULTS.mode;
     if (!TIME_OPTIONS.includes(s.time)) s.time = DEFAULTS.time;
     if (!WORD_OPTIONS.includes(s.words)) s.words = DEFAULTS.words;
     if (!EFFECT_OPTIONS.includes(s.effect)) s.effect = DEFAULTS.effect;
