@@ -38,11 +38,8 @@ How the text is presented. Set it in settings; it persists.
 - **paragraph** — a monkeytype-style wall of three rows, laid out as readable
   lines facing the camera. Finish the active (top) line and the block scrolls up
   one row — the finished line slides out, the next slides in.
-- **stream** — the same three-row measured-flow layout as paragraph, but rendered
-  with the chunky extruded 3D letters instead of flat type. Upright rows on
-  consistent baselines face the camera dead-on at a uniform size; finish the
-  active (top) line and the block scrolls up one row. It reads like paragraph mode
-  with the letters given real depth — the view where the 3D glyphs still shine.
+- **stream** — words fly in from the background. The current word sits up front,
+  big and close; the next few recede into the dark and dim out.
 
 ## Advance
 
