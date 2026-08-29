@@ -6,7 +6,14 @@ import { Text as TroikaText, preloadFont } from 'troika-three-text';
 import * as CANNON from 'cannon-es';
 import { buildSequence } from './words';
 import { buildPhraseSequence, PHRASES } from './phrases';
-import { loadSettings, saveSettings, type Settings, type EffectId } from './settings';
+import {
+  loadSettings,
+  saveSettings,
+  type Settings,
+  type EffectId,
+  STAR_WARS_GOAL_WORDS,
+  STAR_WARS_MILESTONE_WORDS,
+} from './settings';
 import { EffectSystem } from './effects';
 import { Backdrop } from './backdrop';
 import { createUI, type ResultStats } from './ui';
@@ -159,6 +166,11 @@ const CRAWL_AUTO_CHASE = 0.88; // keep the miss line just behind the true pace
 const CRAWL_AUTO_MIN = 0.09; // lines/second clamp — never fully stall (raised with the base)
 const CRAWL_AUTO_MAX = 0.65; // lines/second clamp — never run away (raised with the base)
 const CRAWL_AUTO_TAU = 1.5; // controller smoothing time constant (s)
+// When a fast typist clears several crawl lines ahead of the moving surface,
+// ease the whole plane forward until the active line is back at the entry edge.
+// This keeps the handoff continuous instead of leaving the next text below the
+// camera while the normal crawl pace catches up.
+const CRAWL_CATCHUP_TAU = 0.28;
 
 const isTouch = matchMedia('(hover: none) and (pointer: coarse)').matches;
 
@@ -1281,6 +1293,7 @@ function makeCrawlView(): View {
 
   let lines: CrawlLine[] = [];
   let scroll = 0; // continuous climb progress, in line-heights
+  let scrollTarget = 0; // catch-up target that keeps the active line on the deck
   let packSeq = 0;
   let packIdx = 0;
 
@@ -1305,7 +1318,10 @@ function makeCrawlView(): View {
     let s = packSeq;
     let cursor = -m.colHalf;
     for (;;) {
-      if (settings.mode !== 'words') ensureSeq(s + 1);
+      // Crawl is always an endless survival run, regardless of the hidden mode
+      // setting. Refill the phrase stream as new lines are needed so a player
+      // who clears the visible passage always gets the following crawl text.
+      ensureSeq(s + 1);
       if (s >= seq.length) break;
       const worldW = m.advance * seq[s].length;
       if (words.length > 0 && cursor + worldW > m.colHalf) break;
@@ -1323,14 +1339,13 @@ function makeCrawlView(): View {
 
   function ensureLines(throughIdx: number): void {
     while (packIdx <= throughIdx) {
-      if (settings.mode === 'words' && packSeq >= seq.length) break;
       createLine(packIdx);
     }
   }
 
   function lineIndexOf(seqIdx: number): number {
     for (const l of lines) if (seqIdx >= l.start && seqIdx < l.end) return l.index;
-    while (packSeq <= seqIdx && (settings.mode !== 'words' || packSeq < seq.length)) createLine(packIdx);
+    while (packSeq <= seqIdx) createLine(packIdx);
     for (const l of lines) if (seqIdx >= l.start && seqIdx < l.end) return l.index;
     return lines.length ? lines[lines.length - 1].index : 0;
   }
@@ -1342,6 +1357,10 @@ function makeCrawlView(): View {
     const nearest = Math.ceil(scroll - CRAWL_ENTER_LINEH) + 1;
     const activeLi = lineIndexOf(wordIndex);
     ensureLines(Math.max(nearest, activeLi + CRAWL_VISIBLE_AHEAD));
+    // If typing has moved the active word below the entering edge, ask the
+    // entire crawl to catch up. Recalculating the target means backspacing
+    // cannot leave a stale target that pulls the active line into the miss zone.
+    scrollTarget = Math.max(scroll, activeLi + CRAWL_ENTER_LINEH);
   }
 
   function paint(): void {
@@ -1387,6 +1406,7 @@ function makeCrawlView(): View {
     packSeq = wordIndex;
     packIdx = 0;
     scroll = 0;
+    scrollTarget = 0;
     ensureLinesForScroll();
     paint();
     for (const l of lines) for (const w of l.words) for (const ll of w.letters) ll.vis = ll.visTarget;
@@ -1429,7 +1449,18 @@ function makeCrawlView(): View {
       return { w: Math.max(0.03, m.em * 0.05), h: m.em * 1.05 };
     },
     update(dt: number) {
-      if (state.phase === 'running') scroll += currentSpeed * dt;
+      if (state.phase === 'running') {
+        const naturalScroll = scroll + currentSpeed * dt;
+        if (scrollTarget > naturalScroll) {
+          // Ease the whole plane toward the target, but never slower than its
+          // normal climb. Every line therefore keeps the same spacing and the
+          // following paragraph arrives as one coherent motion.
+          const eased = scroll + (scrollTarget - scroll) * (1 - Math.exp(-dt / CRAWL_CATCHUP_TAU));
+          scroll = Math.min(scrollTarget, Math.max(naturalScroll, eased));
+        } else {
+          scroll = naturalScroll;
+        }
+      }
       ensureLinesForScroll();
 
       // Survival: the instant the active word's line reaches the miss zone the
@@ -1477,6 +1508,7 @@ function makeCrawlView(): View {
       return {
         view: 'crawl',
         lineProgress: +scroll.toFixed(3),
+        lineTarget: +scrollTarget.toFixed(3),
         missLineY: +missY.toFixed(3),
         currentSpeed: +currentSpeed.toFixed(4),
         missed: state.missed,
@@ -1513,6 +1545,7 @@ const state = {
 let rushClock = 0;
 let losing = false;
 let loseTimer = 0;
+let nextMilestone = STAR_WARS_MILESTONE_WORDS;
 
 // What the current run actually is. The crawl view is always survival regardless
 // of the (hidden) mode setting; every other view runs the chosen mode.
@@ -1556,11 +1589,12 @@ function scoreOf(rec: ScoreRecord): number {
 // Per-config PB keys. Survival is a fresh family: the game changed from a
 // wpm-chase to a words-survived chase, so the old wpm-based crawl bests aren't
 // comparable and are intentionally left behind under their old keys. Survival
-// keeps one best per speed (`survival:∞:crawl:<speed>`); rush and sudden death
-// each keep one best per view (`rush:∞:<view>`, `sudden:∞:<view>`); time / words
-// keep the original `<mode>:<amount>:<view>` shape.
+// keeps one best per speed and crawl goal (`survival:<goal>:crawl:<speed>`);
+// rush and sudden death each keep one best per view (`rush:∞:<view>`,
+// `sudden:∞:<view>`); time / words keep the original `<mode>:<amount>:<view>`
+// shape.
 function configKey(): string {
-  if (settings.view === 'crawl') return `survival:∞:crawl:${settings.speed}`;
+  if (settings.view === 'crawl') return `survival:${STAR_WARS_GOAL_WORDS}:crawl:${settings.speed}`;
   if (settings.mode === 'rush') return `rush:∞:${settings.view}`;
   if (settings.mode === 'sudden') return `sudden:∞:${settings.view}`;
   const amount = settings.mode === 'time' ? settings.time : settings.mode === 'words' ? settings.words : 0;
@@ -1612,6 +1646,7 @@ let lastResult: {
 } | null = null;
 
 function wordsTotal(): number {
+  if (settings.view === 'crawl') return STAR_WARS_GOAL_WORDS;
   return settings.mode === 'words' ? settings.words : 0;
 }
 function elapsedSec(): number {
@@ -1653,6 +1688,10 @@ function allCurrentCorrect(): boolean {
   return true;
 }
 
+function currentWordHasError(): boolean {
+  return letterStates.some((s) => s === 'incorrect');
+}
+
 function handleChar(ch: string) {
   if (state.phase === 'finished') return;
   if (ui.isMenuOpen()) return;
@@ -1661,11 +1700,22 @@ function handleChar(ch: string) {
 
   const w = activeView.currentWord();
   if (!w) return;
+  // Once a typo is recorded, lock the word in place. Further characters are
+  // rejected until Backspace removes the bad one, so the player cannot move on
+  // while correct letters are still committed behind it.
+  if (currentWordHasError()) {
+    if (settings.view !== 'crawl') beginIfNeeded();
+    state.incorrect++;
+    caretPulse = 1;
+    if (!activeView.lockCamera) addShake(0.2);
+    activeView.paint();
+    return;
+  }
   const pending = w.letters[letterIdx];
   if (!pending) {
-    // Word is full and holding at least one uncorrected error, so it did not
-    // auto-advance. Extra keystrokes here are overflow: count them as incorrect
-    // and fire a visible pulse — never silently swallow input (the old bug).
+    // Word is full but the selected advance mode still requires a boundary.
+    // Extra characters are overflow: count them as incorrect and fire a visible
+    // pulse — never silently swallow input.
     beginIfNeeded();
     state.incorrect++;
     caretPulse = 1;
@@ -1694,9 +1744,9 @@ function handleChar(ch: string) {
     if (effectiveAdvance() === 'auto' && letterIdx >= w.letters.length && allCurrentCorrect()) completeWord();
     else activeView.paint();
   } else {
-    // Wrong: the letter turns red and the caret advances (monkeytype default);
-    // the word won't complete until the mistake is backspaced and corrected. In
-    // crawl the clock doesn't start on a wrong key (survival begins on a hit).
+    // Wrong: the letter turns red and the caret advances one slot, where it is
+    // deliberately held until Backspace removes the error. In crawl the clock
+    // doesn't start on a wrong key (survival begins on a hit).
     if (settings.view !== 'crawl') beginIfNeeded();
     pending.state = 'incorrect';
     setIncorrect(pending);
@@ -1711,12 +1761,12 @@ function handleChar(ch: string) {
   }
 }
 
-// Monkeytype-style backspace. Within the current word it steps the caret back and
-// reverts the letter to untyped — but it never refunds a keystroke tally, so a
-// corrected mistake still costs accuracy. At the start of a word it steps back
-// into the previous word only if that word is imperfect (holds a wrong or skipped
-// letter), restoring its committed letters for re-editing; a perfect previous
-// word is left alone, exactly as monkeytype does.
+// Backspace only removes an incorrect/skipped committed letter. Correct letters
+// have already exited the scene and remain committed; they never resurface.
+// At the start of a word it steps back into the previous word only if that word
+// is imperfect (holds a wrong or skipped letter), restoring its error states for
+// re-editing. Keystroke tallies are never refunded, so corrected mistakes still
+// cost accuracy.
 function handleBackspace() {
   if (state.phase === 'finished') return;
   if (ui.isMenuOpen()) return;
@@ -1744,6 +1794,8 @@ function handleBackspace() {
 
   const w = activeView.currentWord();
   if (!w) return;
+  const previousState = letterStates[letterIdx - 1];
+  if (previousState !== 'incorrect' && previousState !== 'skipped') return;
   letterIdx--;
   letterStates.pop();
   const l = w.letters[letterIdx];
@@ -1752,13 +1804,14 @@ function handleBackspace() {
 }
 
 // Space is the deliberate word-advance (monkeytype semantics). With no character
-// typed it is a no-op; otherwise it advances, marking any untyped remainder of the
-// current word as skipped errors (each costs a keystroke) if the word was partial
-// or imperfect, or advancing cleanly if it was all-correct. In 'space' mode (the
-// default) this is how every word — even a perfect one — advances; in 'auto' mode
-// a perfect word has already jumped on its last letter, so space there only fires
-// on an imperfect word. Either way advanceWord credits exactly one keystroke for
-// the boundary (the real space here, or the implicit space in auto), never both.
+// typed it is a no-op; a partially typed word with no wrong letters marks its
+// untyped remainder as skipped errors (each costs a keystroke) and advances. A
+// word containing an actual typo is a hard stop until it is corrected. In
+// 'space' mode (the default) this is how every clean word — even a perfect one —
+// advances; in 'auto' mode a perfect word has already jumped on its last letter,
+// so space there only fires on an imperfect word. Either way advanceWord credits
+// exactly one keystroke for the boundary (the real space here, or the implicit
+// space in auto), never both.
 function handleSpace() {
   if (state.phase === 'finished') return;
   if (ui.isMenuOpen()) return;
@@ -1766,6 +1819,16 @@ function handleSpace() {
   if (letterIdx === 0) return; // nothing typed yet — no-op
   const w = activeView.currentWord();
   if (!w) return;
+  // A misspelled word is a hard boundary: do not let Space commit it and move
+  // to the next word. The typist must backspace to the bad letter and correct
+  // it first. Skipping untouched letters is still allowed when no typo exists,
+  // preserving the deliberate-space semantics of the default mode.
+  if (currentWordHasError()) {
+    caretPulse = 1;
+    if (!activeView.lockCamera) addShake(0.2);
+    activeView.paint();
+    return;
+  }
   beginIfNeeded();
   const hadSkip = letterIdx < w.letters.length;
   for (let i = letterIdx; i < w.letters.length; i++) {
@@ -1786,6 +1849,7 @@ function handleSpace() {
 }
 
 function completeWord() {
+  if (currentWordHasError()) return;
   advanceWord(true); // implicit space credited — keeps WPM honest
 }
 
@@ -1800,6 +1864,18 @@ function advanceWord(creditSpace: boolean) {
   if (creditSpace && runKind() === 'rush') rushClock = Math.min(RUSH_MAX, rushClock + RUSH_ADD);
   wordHistory[wordIndex] = letterStates.slice(); // remember for backspace-into-previous
   letterStates = [];
+  if (runKind() === 'survival') {
+    // Checkpoints make the finite crawl feel like a race with visible progress,
+    // while the final word produces the normal results card.
+    while (state.wordsDone >= nextMilestone && nextMilestone < STAR_WARS_GOAL_WORDS) {
+      ui.showMilestone(`checkpoint ${nextMilestone} / ${STAR_WARS_GOAL_WORDS}`);
+      nextMilestone += STAR_WARS_MILESTONE_WORDS;
+    }
+    if (state.wordsDone >= STAR_WARS_GOAL_WORDS) {
+      endRun('goal');
+      return;
+    }
+  }
   if (runKind() === 'words' && state.wordsDone >= settings.words) {
     endRun('complete');
     return;
@@ -1851,8 +1927,9 @@ function addShake(mag: number) {
 // ---------------------------------------------------------------------------
 function newSequence() {
   // Crawl (survival) types Star-Wars-flavored phrase lines; the other views use
-  // the random English pool. Words mode packs exactly the requested count.
-  if (settings.view === 'crawl') seq = buildPhraseSequence(160);
+  // the random English pool. Crawl grows this phrase sequence lazily as the
+  // endless survival run needs more lines; words mode packs exactly its count.
+  if (settings.view === 'crawl') seq = buildPhraseSequence(80);
   else if (settings.mode === 'words') seq = buildSequence(settings.words);
   else seq = buildSequence(120);
 }
@@ -1884,11 +1961,13 @@ function restart() {
   rushClock = 0;
   losing = false;
   loseTimer = 0;
+  nextMilestone = STAR_WARS_MILESTONE_WORDS;
   effects.reset();
   resultsPanel.hide();
   shake.set(0, 0, 0);
   canvas.classList.remove('hyper'); // clear any hyperspace-loss fade
   ui.hideResults();
+  ui.hideMilestone();
   ui.closeMenu();
   ui.setHudVisible(true);
   wordIndex = 0;
@@ -1908,7 +1987,7 @@ function restart() {
   if (isTouch) capture.focus({ preventScroll: true });
 }
 
-type EndKind = 'complete' | 'survival' | 'rush' | 'sudden';
+type EndKind = 'complete' | 'goal' | 'survival' | 'rush' | 'sudden';
 
 // The stats + PB bookkeeping for the finished run, held between the loss
 // animation firing and its card appearing. Also surfaced through lastResult.
@@ -1926,6 +2005,7 @@ function endRun(kind: EndKind) {
   state.phase = 'finished';
   ui.setHudVisible(false);
   ui.hidePrompt();
+  ui.hideMilestone();
   pendingStats = buildStats(kind);
 
   if (kind === 'survival') {
@@ -1942,7 +2022,7 @@ function endRun(kind: EndKind) {
     losing = true;
     loseTimer = SUDDEN_DUR;
   } else {
-    presentResults(); // time / words complete, rush timeout → card immediately
+    presentResults(); // goal / time / words complete, rush timeout → immediately
   }
 }
 
@@ -1975,7 +2055,12 @@ function buildStats(kind: EndKind): ResultStats {
   let headlineLabel = 'wpm';
   let cells: [string, string][] | undefined;
   let hint: string | undefined;
-  if (kind === 'survival') {
+  if (kind === 'goal') {
+    title = 'crawl complete';
+    headlineLabel = 'reached';
+    cells = [['wpm', String(wpm)], ['acc', accuracy() + '%'], ['time', `${t.toFixed(1)}s`]];
+    hint = 'enter — run it again · or tap';
+  } else if (kind === 'survival') {
     title = 'lost to hyperspace';
     headlineLabel = 'survived';
     cells = [['wpm', String(wpm)], ['acc', accuracy() + '%'], ['time', `${t.toFixed(1)}s`]];
@@ -2333,10 +2418,10 @@ function updateHud() {
   let progressKind: 'normal' | 'clock' | 'clockUrgent' = 'normal';
   const kind = runKind();
   if (kind === 'survival') {
-    // Crawl is always survival — words survived is the whole score.
+    // Crawl is a finite survival race: the HUD keeps the finish line visible.
     modeLabel = 'survival';
-    progress = String(state.wordsDone);
-    extra = 'survived';
+    progress = `${state.wordsDone}/${STAR_WARS_GOAL_WORDS}`;
+    extra = 'to finish';
   } else if (kind === 'rush') {
     // The clock is the star of the HUD: gold, and tenths under 5s.
     modeLabel = 'rush';
@@ -2416,6 +2501,8 @@ function snapshot() {
     incorrect: state.incorrect,
     wordsDone: state.wordsDone,
     wordsTotal: wordsTotal(),
+    goal: settings.view === 'crawl' ? STAR_WARS_GOAL_WORDS : wordsTotal(),
+    nextMilestone: settings.view === 'crawl' ? nextMilestone : null,
     elapsed: elapsedSec(),
     current: seq[wordIndex] ?? '',
     wordIndex,

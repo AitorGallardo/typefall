@@ -17,6 +17,7 @@ import {
   SPEED_LABELS,
   ADVANCE_OPTIONS,
   ADVANCE_LABELS,
+  STAR_WARS_GOAL_WORDS,
 } from './settings';
 
 export interface ResultStats {
@@ -91,10 +92,13 @@ export function createUI(cb: UICallbacks) {
   // --- "type to begin" prompt (crawl at rest) — quiet gold mono line --------
   const prompt = el('div', 'prompt hidden');
 
+  // --- Star Wars checkpoints ----------------------------------------------
+  const milestone = el('div', 'milestone hidden');
+
   // --- sudden-death red flinch — a quick full-screen red wash --------------
   const redFlash = el('div', 'red-flash');
 
-  root.append(hud, gear, focusLost, prompt, redFlash);
+  root.append(hud, gear, focusLost, prompt, milestone, redFlash);
 
   // --- results overlay --------------------------------------------------
   const results = el('div', 'overlay results hidden');
@@ -126,6 +130,7 @@ export function createUI(cb: UICallbacks) {
   let menuOpen = false;
   let opts: HTMLButtonElement[] = [];
   let focusIdx = 0;
+  let milestoneTimer: number | undefined;
 
   function buildMenu(): void {
     const s = cb.getSettings();
@@ -151,6 +156,10 @@ export function createUI(cb: UICallbacks) {
         opt(SPEED_LABELS[sp], s.speed === sp ? 'sel' : '', () => cb.applySettings({ speed: sp })),
       );
       panel.appendChild(wrapRow('speed', speedBtns));
+
+      const goal = el('span', 'p-na');
+      goal.textContent = `${STAR_WARS_GOAL_WORDS} words to finish`;
+      panel.appendChild(wrapRow('goal', [goal]));
     }
 
     // advance — space (deliberate, default) vs auto (on last correct letter).
@@ -316,6 +325,25 @@ export function createUI(cb: UICallbacks) {
     },
     hidePrompt() {
       prompt.classList.add('hidden');
+    },
+    showMilestone(text: string) {
+      if (milestoneTimer != null) window.clearTimeout(milestoneTimer);
+      milestone.textContent = text;
+      milestone.classList.remove('hidden', 'run');
+      // Force a reflow so consecutive checkpoints restart the animation.
+      void milestone.offsetWidth;
+      milestone.classList.add('run');
+      milestoneTimer = window.setTimeout(() => {
+        milestone.classList.add('hidden');
+        milestone.classList.remove('run');
+        milestoneTimer = undefined;
+      }, 1400);
+    },
+    hideMilestone() {
+      if (milestoneTimer != null) window.clearTimeout(milestoneTimer);
+      milestoneTimer = undefined;
+      milestone.classList.add('hidden');
+      milestone.classList.remove('run');
     },
     // Quick red flinch for sudden death, then it fades on its own.
     flashRed() {

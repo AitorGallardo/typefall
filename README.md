@@ -2,12 +2,12 @@
 
 A 3D typing test. It works like [monkeytype](https://monkeytype.com), but the
 words are real extruded 3D letters. The default view is **star wars**, and it's
-a survival game: a Star Wars opening crawl that types short, Star-Wars-flavored
+a finite race: a Star Wars opening crawl that types short, Star-Wars-flavored
 lines instead of random words, tilting back and climbing toward a horizon. The
-crawl is frozen until your first keystroke, then it starts moving. Keep ahead of
-it. The moment one word reaches the top zone, the run is over — the stars stretch
-into a hyperspace jump and the crawl streaks away. Then you're one keystroke from
-going again. It reads how far you got, not how fast.
+crawl is frozen until your first keystroke, then it climbs toward a 100-word
+finish line. Gold checkpoints appear every 10 words, and reaching the goal ends
+the run with a completion card; letting a word reach the top still ends it in a
+hyperspace jump.
 
 Every correct keystroke detaches a copy of that letter and blows it away with
 whatever completion effect you picked — it falls and piles on the floor, or
@@ -25,6 +25,8 @@ turned that into a survival run you retry the way you'd pull a slot machine.
 ## Controls
 
 - **Type** — the words in front of you. Correct letters detach and fly off.
+- **Backspace** — remove the latest mistyped letter; successfully typed letters
+  stay committed and never resurface.
 - **Tab** — open the menu / restart the test.
 - **Tab then Enter** — restart (monkeytype muscle memory).
 - **Esc** or the **gear** — open settings.
@@ -39,8 +41,10 @@ How the text is presented. Set it in settings; it persists.
 - **star wars** (default) — the survival crawl. It types short Star-Wars-flavored
   lines — a handful of iconic catchphrases plus a set of original crawl lines I
   wrote (rebellions, star systems, fallen empires), shuffled each run. It's
-  frozen until your first keystroke, then it climbs, and one word reaching the
-  top ends the run in a hyperspace jump. No modes here — it's always survival.
+  frozen until your first keystroke, then it climbs toward a 100-word goal, with
+  a checkpoint trigger every 10 words. Reaching the goal finishes the run;
+  letting one word reach the top still ends it in a hyperspace jump. No modes
+  here — it's always survival.
   The **speed** setting sets the climb rate: 1x, 1.4x, 1.9x, 2.5x, or **auto**,
   which rubber-bands the climb to your rolling WPM so the line always sits just
   behind you. Each speed keeps its own best, scored by words survived.
@@ -56,7 +60,8 @@ How the text is presented. Set it in settings; it persists.
 (Applies to paragraph and star wars. Stream always auto-advances.)
 
 - **space** (default) — a word advances when you press space, even if you typed
-  it perfectly. Skipped letters are marked as errors, monkeytype-style.
+  it perfectly. Skipped letters are marked as errors, monkeytype-style; a word
+  containing a wrong letter must be corrected before Space can advance.
 - **auto** — an all-correct word advances the instant its last letter lands.
 
 ## Modes
