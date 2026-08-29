@@ -40,6 +40,11 @@ export interface Settings {
 export const TIME_OPTIONS = [15, 30, 60];
 export const WORD_OPTIONS = [10, 25, 50];
 
+// Star Wars is a finite race now: the run has a clear finish line and regular
+// checkpoints so survival does not feel like an open-ended crawl.
+export const STAR_WARS_GOAL_WORDS = 100;
+export const STAR_WARS_MILESTONE_WORDS = 10;
+
 // Mode picker order (paragraph + stream). Crawl hides this row — it is always
 // survival.
 export const MODE_OPTIONS: ModeId[] = ['time', 'words', 'zen', 'rush', 'sudden'];
